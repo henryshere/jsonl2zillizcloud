@@ -3,9 +3,10 @@ jsonl_to_parquet.py
 -------------------
 End-to-end pipeline:
   1. (Optional) Create Zilliz Cloud collection with schema & indexes
-  2. Stream JSONL → embed caption via SiliconFlow API → write chunked Parquet
-  3. Upload Parquet files to Zilliz Cloud Volume
-  4. Trigger bulk_import and poll until done
+  2. Stream JSONL → embed caption via SiliconFlow API → write Parquet
+     Each segment is uploaded to Volume immediately after flush,
+     then the local file is deleted — local disk never exceeds ~1 GB.
+  3. Trigger bulk_import and poll until done
 
 Install:
   pip install "pymilvus[bulk_writer]>=2.5" aiohttp tqdm tenacity
@@ -214,13 +215,29 @@ def save_checkpoint(ckpt_path: Path, line_offset: int) -> None:
         json.dump({"line_offset": line_offset}, f)
 
 
-def build_writer(schema, output_dir: str, chunk_size: int) -> LocalBulkWriter:
+def build_writer(schema, output_dir: str, segment_size: int) -> LocalBulkWriter:
     return LocalBulkWriter(
         schema=schema,
         local_path=output_dir,
-        chunk_size=chunk_size,
+        chunk_size=segment_size,
         file_type=BulkFileType.PARQUET,
     )
+
+
+def upload_and_delete_parquet(vfm, data_path: str) -> int:
+    """Upload all .parquet files under data_path to Volume, then delete them.
+    Returns number of files uploaded."""
+    data_dir = Path(data_path)
+    parquet_files = sorted(data_dir.glob("**/*.parquet"))
+    for pf in parquet_files:
+        vfm.upload_file_to_volume(
+            source_file_path=str(pf),
+            target_volume_path="data/",
+        )
+        log.info("Uploaded %s (%d MB)", pf.name, pf.stat().st_size // (1024 * 1024))
+        pf.unlink()
+        log.info("Deleted local file %s", pf.name)
+    return len(parquet_files)
 
 
 def build_schema_for_writer(dim: int):
@@ -278,13 +295,13 @@ def make_row(record: dict, vector: list[float] | None, dim: int) -> dict:
     }
 
 
-async def stream_embed_write(args: argparse.Namespace) -> str:
+async def stream_embed_write(args: argparse.Namespace, vfm) -> None:
     """
     Main processing loop.
-    Returns the writer's data_path for upload.
+    Streams JSONL → embeds → writes Parquet segments.
+    Each segment is uploaded to Volume and deleted locally immediately.
     """
     schema = build_schema_for_writer(args.dim)
-    writer = build_writer(schema, args.output_dir, args.segment_size)
 
     ckpt_path = Path(args.output_dir) / "checkpoint.json"
     resume_offset = load_checkpoint(ckpt_path)
@@ -301,6 +318,20 @@ async def stream_embed_write(args: argparse.Namespace) -> str:
     total = count_lines(args.input)
     log.info("~%d lines found.", total)
 
+    # Estimate rows per segment.
+    # Each row ≈ 4*1024 (vector) + ~2 KB (scalars+json) ≈ 6 KB.
+    # With 1 GB segment_size → ~170K rows per segment.
+    est_row_bytes = args.dim * 4 + 2048
+    rows_per_segment = max(1000, args.segment_size // est_row_bytes)
+    log.info("Estimated ~%d rows per segment (~%d MB each).",
+             rows_per_segment, args.segment_size // (1024 * 1024))
+
+    # State
+    writer = build_writer(schema, args.output_dir, args.segment_size)
+    rows_in_segment = 0
+    total_rows = 0
+    total_uploaded = 0
+
     # Accumulators for micro-batching
     batch_texts: list[str] = []        # texts to embed
     batch_records: list[dict] = []     # corresponding records
@@ -308,6 +339,7 @@ async def stream_embed_write(args: argparse.Namespace) -> str:
 
     async def flush_batch():
         """Embed accumulated texts and write all rows to writer."""
+        nonlocal rows_in_segment
         if not batch_records:
             return
 
@@ -334,10 +366,28 @@ async def stream_embed_write(args: argparse.Namespace) -> str:
                 vec = None
             row = make_row(record, vec, args.dim)
             writer.append_row(row)
+            rows_in_segment += 1
 
         batch_texts.clear()
         batch_records.clear()
         batch_has_text.clear()
+
+    def flush_segment():
+        """Commit writer → upload to Volume → delete local files → new writer."""
+        nonlocal writer, rows_in_segment, total_uploaded
+        if rows_in_segment == 0:
+            return
+
+        writer.commit()
+        data_path = str(writer.data_path)
+        n = upload_and_delete_parquet(vfm, data_path)
+        total_uploaded += n
+        log.info("Segment done: %d rows, %d file(s) uploaded. Total uploaded: %d",
+                 rows_in_segment, n, total_uploaded)
+
+        # Start a fresh writer for the next segment
+        rows_in_segment = 0
+        writer = build_writer(schema, args.output_dir, args.segment_size)
 
     line_no = 0
     with tqdm(total=total, desc="Processing", unit="row", initial=resume_offset) as bar:
@@ -369,25 +419,29 @@ async def stream_embed_write(args: argparse.Namespace) -> str:
                 if not has_text:
                     log.warning("Empty caption at line %d, id=%s", line_no, record.get("id", "?"))
 
-                # Flush when we have enough texts for one API call
+                # Flush embedding batch when full
                 if sum(batch_has_text) >= args.batch_size:
                     await flush_batch()
+
+                # Flush segment: commit → upload → delete → new writer
+                if rows_in_segment >= rows_per_segment:
+                    flush_segment()
+                    save_checkpoint(ckpt_path, line_no)
 
                 # Save checkpoint periodically (every 10k lines)
                 if line_no % 10000 == 0:
                     save_checkpoint(ckpt_path, line_no)
 
+                total_rows += 1
                 bar.update(1)
 
-    # Final flush
+    # Final flushes
     await flush_batch()
-    writer.commit()
+    flush_segment()
     await embedder.close()
 
     save_checkpoint(ckpt_path, line_no)
-    log.info("Wrote %d rows total. Data path: %s", writer.total_row_count, writer.data_path)
-
-    return str(writer.data_path)
+    log.info("All done. %d rows processed, %d segment(s) uploaded.", total_rows, total_uploaded)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -414,26 +468,13 @@ def ensure_volume(api_key: str, project_id: str, region_id: str, volume_name: st
     log.info("Volume '%s' created.", volume_name)
 
 
-def upload_to_volume(api_key: str, volume_name: str, data_path: str):
-    """Upload all Parquet files from data_path to the Volume."""
-    vfm = VolumeFileManager(
+def create_volume_file_manager(api_key: str, volume_name: str) -> VolumeFileManager:
+    """Create a VolumeFileManager for uploading files."""
+    return VolumeFileManager(
         cloud_endpoint=ZILLIZ_CLOUD_CN,
         api_key=api_key,
         volume_name=volume_name,
     )
-
-    data_dir = Path(data_path)
-    parquet_files = sorted(data_dir.glob("**/*.parquet"))
-    log.info("Uploading %d parquet file(s) to volume '%s' …", len(parquet_files), volume_name)
-
-    for pf in tqdm(parquet_files, desc="Uploading", unit="file"):
-        vfm.upload_file_to_volume(
-            source_file_path=str(pf),
-            target_volume_path="data/",
-        )
-        log.info("Uploaded %s", pf.name)
-
-    log.info("All files uploaded to volume '%s'.", volume_name)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -492,14 +533,14 @@ def run(args: argparse.Namespace):
         create_collection(client, args.collection, args.dim)
         client.close()
 
-    # Step 2: Stream → embed → write Parquet
-    data_path = asyncio.run(stream_embed_write(args))
-
-    # Step 3: Upload to Volume
+    # Step 2: Ensure Volume exists
     ensure_volume(args.zilliz_api_key, args.project_id, args.region_id, args.volume_name)
-    upload_to_volume(args.zilliz_api_key, args.volume_name, data_path)
+    vfm = create_volume_file_manager(args.zilliz_api_key, args.volume_name)
 
-    # Step 4: bulk_import
+    # Step 3: Stream → embed → write Parquet → upload each segment → delete local
+    asyncio.run(stream_embed_write(args, vfm))
+
+    # Step 4: bulk_import (all segments are already on Volume)
     run_bulk_import(args)
 
     log.info("All done.")

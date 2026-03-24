@@ -5,11 +5,9 @@
 A Python CLI script that:
 
 1. **Creates** the Zilliz Cloud collection (with schema, indexes, and `auto_id=True`)
-2. **Streams** a massive JSONL file (up to 500M rows) in constant memory
-3. **Embeds** the `caption` field by calling the SiliconFlow REST API
-4. **Writes** chunked Parquet files (with pre-computed vectors) via `pymilvus.LocalBulkWriter`
-5. **Uploads** Parquet chunks to a Zilliz Cloud Volume (Alibaba Cloud, Beijing region)
-6. **Triggers** `bulk_import` to load data into the collection
+2. **Ensures** the Zilliz Cloud Volume exists (Alibaba Cloud, Beijing region)
+3. **Streams** a massive JSONL file (up to 500M rows) in constant memory, embeds the `caption` field via SiliconFlow API, writes Parquet segments via `pymilvus.LocalBulkWriter`, and **uploads each segment to Volume immediately after flush, then deletes the local file** — local disk never exceeds ~1 GB
+4. **Triggers** `bulk_import` to load all uploaded data into the collection
 
 Use `--skip-create` to skip step 1 if the collection already exists.
 
@@ -21,7 +19,10 @@ Use `--skip-create` to skip step 1 if the collection already exists.
 Step 1: Create Collection (skip with --skip-create)
   │
   ▼
-Step 2: Stream JSONL → Embed → Write Parquet
+Step 2: Ensure Volume exists (Aliyun Beijing)
+  │
+  ▼
+Step 3: Stream JSONL → Embed → Write Parquet → Upload → Delete (per segment)
   │
   │  JSONL (stream line-by-line, ~2 KB RAM per line)
   │    │
@@ -31,13 +32,27 @@ Step 2: Stream JSONL → Embed → Write Parquet
   │    │
   │    ├─ pack entire line ──▶ raw_json (JSON field, ≤64 KB)
   │    │
-  │    └─ LocalBulkWriter (1 GB segment) ──▶ part-*.parquet
+  │    └─ LocalBulkWriter (1 GB segment) ──▶ segment.parquet
+  │         │
+  │         ├─ upload to Volume immediately
+  │         ├─ delete local file
+  │         └─ create fresh writer for next segment
   │
   ▼
-Step 3: Upload to Volume (Aliyun Beijing)
-  │
-  ▼
-Step 4: bulk_import into Collection
+Step 4: bulk_import into Collection (all segments already on Volume)
+```
+
+### Segment Lifecycle (upload-as-you-go)
+
+```
+  ┌────────────┐     ┌────────────┐     ┌────────────┐
+  │ Write ~170K│     │ Upload to  │     │ Delete     │
+  │ rows into  │────▶│ Volume     │────▶│ local file │──▶ next segment …
+  │ Parquet    │     │            │     │            │
+  └────────────┘     └────────────┘     └────────────┘
+       ~1 GB              network            frees disk
+
+Local disk usage: always ≤ 1 GB (one segment at a time)
 ```
 
 ---
@@ -217,16 +232,20 @@ client.create_collection(
 
 ---
 
-## Memory Usage
+## Memory & Disk Usage
 
-| Component                       | Memory               |
-|---------------------------------|----------------------|
-| JSONL reader                    | ~2 KB (one line)     |
-| SiliconFlow API text batch      | 32 × ~1.5 KB ≈ 48 KB|
-| LocalBulkWriter segment buffer  | up to 1 GB           |
-| **Total peak**                  | **~1 GB**            |
+| Resource | Component                       | Usage                |
+|----------|---------------------------------|----------------------|
+| RAM      | JSONL reader                    | ~2 KB (one line)     |
+| RAM      | SiliconFlow API text batch      | 32 × ~1.5 KB ≈ 48 KB|
+| RAM      | LocalBulkWriter segment buffer  | up to 1 GB           |
+| **RAM**  | **Total peak**                  | **~1 GB**            |
+| Disk     | One Parquet segment (written, pending upload) | up to 1 GB |
+| Disk     | Checkpoint file                 | < 1 KB               |
+| **Disk** | **Total peak**                  | **~1 GB**            |
 
-Constant regardless of total file size (500M rows safe).
+Both RAM and disk are constant regardless of total file size (500M rows safe).
+Segments are uploaded to Volume and deleted locally immediately after flush — no accumulation.
 
 ---
 
