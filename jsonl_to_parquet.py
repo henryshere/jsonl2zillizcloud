@@ -133,7 +133,13 @@ class SiliconFlowEmbedder:
 
     async def _ensure_session(self):
         if self._session is None or self._session.closed:
+            # import ssl
+            # ssl_ctx = ssl.create_default_context()
+            # ssl_ctx.check_hostname = False
+            # ssl_ctx.verify_mode = ssl.CERT_NONE
+            # connector = aiohttp.TCPConnector(ssl=ssl_ctx)
             self._session = aiohttp.ClientSession(
+                # connector=connector,
                 headers={
                     "Authorization": f"Bearer {self.api_key}",
                     "Content-Type": "application/json",
@@ -224,24 +230,27 @@ def build_writer(schema, output_dir: str, segment_size: int) -> LocalBulkWriter:
     )
 
 
-def upload_and_delete_parquet(vfm, data_path: str) -> int:
-    """Upload all .parquet files under data_path to Volume, then delete them.
-    Returns number of files uploaded."""
+def upload_and_delete_parquet(vfm, data_path: str, segment_idx: int) -> int:
+    """Upload all .parquet files under data_path to Volume with unique names,
+    then delete them locally.  Returns number of files uploaded."""
     data_dir = Path(data_path)
     parquet_files = sorted(data_dir.glob("**/*.parquet"))
-    for pf in parquet_files:
+    for file_index, pf in enumerate(parquet_files):
+        remote_name = f"part-{segment_idx:06d}-{file_index}.parquet"
+        # Rename LOCALLY first so the Volume receives the unique name
+        renamed = pf.parent / remote_name
+        pf.rename(renamed)
         vfm.upload_file_to_volume(
-            source_file_path=str(pf),
+            source_file_path=str(renamed),
             target_volume_path="data/",
         )
-        log.info("Uploaded %s (%d MB)", pf.name, pf.stat().st_size // (1024 * 1024))
-        pf.unlink()
-        log.info("Deleted local file %s", pf.name)
+        log.info("Uploaded %s (%d MB)", remote_name, renamed.stat().st_size // (1024 * 1024))
+        renamed.unlink()
+        log.info("Deleted local file %s", remote_name)
     return len(parquet_files)
 
 
 def build_schema_for_writer(dim: int):
-    """Build a schema for LocalBulkWriter (no autoid — Zilliz generates it)."""
     schema = MilvusClient.create_schema(auto_id=True, enable_dynamic_field=False)
 
     schema.add_field("autoid",                 DataType.INT64,        is_primary=True)
@@ -260,6 +269,7 @@ def build_schema_for_writer(dim: int):
     schema.add_field("rand",                   DataType.FLOAT)
     schema.add_field("raw_json",               DataType.JSON)
     schema.add_field("caption_vector",         DataType.FLOAT_VECTOR, dim=dim)
+    schema.verify()
 
     return schema
 
@@ -275,6 +285,7 @@ def make_row(record: dict, vector: list[float] | None, dim: int) -> dict:
     if len(raw_json_str.encode("utf-8")) > 65536:
         log.warning("raw_json exceeds 64 KB for id=%s, truncating.", record.get("id", "?"))
         raw_json_str = raw_json_str[:65000] + "…}"
+    # log.info("浮点数列表: %s", vector[:2])
 
     return {
         "id":                     str(record.get("id", "")),
@@ -365,6 +376,7 @@ async def stream_embed_write(args: argparse.Namespace, vfm) -> None:
             else:
                 vec = None
             row = make_row(record, vec, args.dim)
+            # log.info("向量数量: %d 行, 每行维度: %d", len(sub_result), len(sub_result[0]))
             writer.append_row(row)
             rows_in_segment += 1
 
@@ -372,15 +384,17 @@ async def stream_embed_write(args: argparse.Namespace, vfm) -> None:
         batch_records.clear()
         batch_has_text.clear()
 
+    segment_idx = 0
     def flush_segment():
         """Commit writer → upload to Volume → delete local files → new writer."""
-        nonlocal writer, rows_in_segment, total_uploaded
+        nonlocal writer, rows_in_segment, total_uploaded, segment_idx
         if rows_in_segment == 0:
             return
 
         writer.commit()
         data_path = str(writer.data_path)
-        n = upload_and_delete_parquet(vfm, data_path)
+        n = upload_and_delete_parquet(vfm, data_path, segment_idx)
+        segment_idx += 1
         total_uploaded += n
         log.info("Segment done: %d rows, %d file(s) uploaded. Total uploaded: %d",
                  rows_in_segment, n, total_uploaded)
@@ -425,6 +439,7 @@ async def stream_embed_write(args: argparse.Namespace, vfm) -> None:
 
                 # Flush segment: commit → upload → delete → new writer
                 if rows_in_segment >= rows_per_segment:
+                    # log.info("rows_in_segment is '%d' , rows_per_segment is '%d'.", rows_in_segment, rows_per_segment)
                     flush_segment()
                     save_checkpoint(ckpt_path, line_no)
 
@@ -567,7 +582,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-retries",  type=int, default=3,    help="Max retries per API call")
 
     # Writer
-    p.add_argument("--segment-size", type=int, default=1024*1024*1024, help="Bytes per Parquet chunk")
+    p.add_argument("--segment-size", type=int, default=1024*1024*10, help="Bytes per Parquet chunk")
 
     # Zilliz Cloud
     p.add_argument("--collection",       required=True, help="Collection name")
