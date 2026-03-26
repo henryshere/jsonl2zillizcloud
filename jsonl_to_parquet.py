@@ -230,25 +230,6 @@ def build_writer(schema, output_dir: str, segment_size: int) -> LocalBulkWriter:
     )
 
 
-def upload_and_delete_parquet(vfm, data_path: str, segment_idx: int) -> int:
-    """Upload all .parquet files under data_path to Volume with unique names,
-    then delete them locally.  Returns number of files uploaded."""
-    data_dir = Path(data_path)
-    parquet_files = sorted(data_dir.glob("**/*.parquet"))
-    for file_index, pf in enumerate(parquet_files):
-        remote_name = f"part-{segment_idx:06d}-{file_index}.parquet"
-        # Rename LOCALLY first so the Volume receives the unique name
-        renamed = pf.parent / remote_name
-        pf.rename(renamed)
-        vfm.upload_file_to_volume(
-            source_file_path=str(renamed),
-            target_volume_path="data/",
-        )
-        log.info("Uploaded %s (%d MB)", remote_name, renamed.stat().st_size // (1024 * 1024))
-        renamed.unlink()
-        log.info("Deleted local file %s", remote_name)
-    return len(parquet_files)
-
 
 def build_schema_for_writer(dim: int):
     schema = MilvusClient.create_schema(auto_id=True, enable_dynamic_field=False)
@@ -285,8 +266,6 @@ def make_row(record: dict, vector: list[float] | None, dim: int) -> dict:
     if len(raw_json_str.encode("utf-8")) > 65536:
         log.warning("raw_json exceeds 64 KB for id=%s, truncating.", record.get("id", "?"))
         raw_json_str = raw_json_str[:65000] + "…}"
-    # log.info("浮点数列表: %s", vector[:2])
-
     return {
         "id":                     str(record.get("id", "")),
         "path":                   str(record.get("path", "")),
@@ -302,7 +281,7 @@ def make_row(record: dict, vector: list[float] | None, dim: int) -> dict:
         "image_512":              str(record.get("image_512", "")),
         "rand":                   float(record.get("rand", 0.0)),
         "raw_json":               json.loads(raw_json_str),  # JSON field expects dict
-        "caption_vector":         vector if vector else [0.0] * dim,
+        "caption_vector":         [float(x) for x in vector] if vector else [0.0] * dim,
     }
 
 
@@ -329,17 +308,11 @@ async def stream_embed_write(args: argparse.Namespace, vfm) -> None:
     total = count_lines(args.input)
     log.info("~%d lines found.", total)
 
-    # Estimate rows per segment.
-    # Each row ≈ 4*1024 (vector) + ~2 KB (scalars+json) ≈ 6 KB.
-    # With 1 GB segment_size → ~170K rows per segment.
-    est_row_bytes = args.dim * 4 + 2048
-    rows_per_segment = max(1000, args.segment_size // est_row_bytes)
-    log.info("Estimated ~%d rows per segment (~%d MB each).",
-             rows_per_segment, args.segment_size // (1024 * 1024))
+    log.info("Segment size: %d MB. Writer auto-flushes at this size.",
+             args.segment_size // (1024 * 1024))
 
     # State
     writer = build_writer(schema, args.output_dir, args.segment_size)
-    rows_in_segment = 0
     total_rows = 0
     total_uploaded = 0
 
@@ -350,7 +323,6 @@ async def stream_embed_write(args: argparse.Namespace, vfm) -> None:
 
     async def flush_batch():
         """Embed accumulated texts and write all rows to writer."""
-        nonlocal rows_in_segment
         if not batch_records:
             return
 
@@ -376,32 +348,38 @@ async def stream_embed_write(args: argparse.Namespace, vfm) -> None:
             else:
                 vec = None
             row = make_row(record, vec, args.dim)
-            # log.info("向量数量: %d 行, 每行维度: %d", len(sub_result), len(sub_result[0]))
             writer.append_row(row)
-            rows_in_segment += 1
 
         batch_texts.clear()
         batch_records.clear()
         batch_has_text.clear()
 
+        # Check if writer auto-flushed any Parquet files
+        upload_ready_parquets("auto-flush")
+
     segment_idx = 0
-    def flush_segment():
-        """Commit writer → upload to Volume → delete local files → new writer."""
-        nonlocal writer, rows_in_segment, total_uploaded, segment_idx
-        if rows_in_segment == 0:
+
+    def upload_ready_parquets(label: str = ""):
+        """Scan output dir for .parquet files, upload and delete them."""
+        nonlocal segment_idx, total_uploaded
+        data_dir = Path(str(writer.data_path))
+        if not data_dir.exists():
             return
-
-        writer.commit()
-        data_path = str(writer.data_path)
-        n = upload_and_delete_parquet(vfm, data_path, segment_idx)
-        segment_idx += 1
-        total_uploaded += n
-        log.info("Segment done: %d rows, %d file(s) uploaded. Total uploaded: %d",
-                 rows_in_segment, n, total_uploaded)
-
-        # Start a fresh writer for the next segment
-        rows_in_segment = 0
-        writer = build_writer(schema, args.output_dir, args.segment_size)
+        parquet_files = sorted(data_dir.glob("*.parquet"))
+        for pf in parquet_files:
+            remote_name = f"part-{segment_idx:06d}.parquet"
+            renamed = pf.parent / remote_name
+            pf.rename(renamed)
+            vfm.upload_file_to_volume(
+                source_file_path=str(renamed),
+                target_volume_path="data/",
+            )
+            tag = f"[{label}] " if label else ""
+            log.info("%sUploaded %s (%d MB)", tag, remote_name,
+                     renamed.stat().st_size // (1024 * 1024))
+            renamed.unlink()
+            segment_idx += 1
+            total_uploaded += 1
 
     line_no = 0
     with tqdm(total=total, desc="Processing", unit="row", initial=resume_offset) as bar:
@@ -437,12 +415,6 @@ async def stream_embed_write(args: argparse.Namespace, vfm) -> None:
                 if sum(batch_has_text) >= args.batch_size:
                     await flush_batch()
 
-                # Flush segment: commit → upload → delete → new writer
-                if rows_in_segment >= rows_per_segment:
-                    # log.info("rows_in_segment is '%d' , rows_per_segment is '%d'.", rows_in_segment, rows_per_segment)
-                    flush_segment()
-                    save_checkpoint(ckpt_path, line_no)
-
                 # Save checkpoint periodically (every 10k lines)
                 if line_no % 10000 == 0:
                     save_checkpoint(ckpt_path, line_no)
@@ -452,7 +424,8 @@ async def stream_embed_write(args: argparse.Namespace, vfm) -> None:
 
     # Final flushes
     await flush_batch()
-    flush_segment()
+    writer.commit()
+    upload_ready_parquets("final")
     await embedder.close()
 
     save_checkpoint(ckpt_path, line_no)
