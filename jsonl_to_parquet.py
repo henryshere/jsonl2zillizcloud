@@ -3,18 +3,19 @@ jsonl_to_parquet.py
 -------------------
 End-to-end pipeline:
   1. (Optional) Create Zilliz Cloud collection with schema & indexes
-  2. Stream JSONL → embed caption via SiliconFlow API → write Parquet
-     Each segment is uploaded to Volume immediately after flush,
-     then the local file is deleted — local disk never exceeds ~1 GB.
+  2. Stream JSONL → embed caption (remote API or local vLLM) → write Parquet
+     Each segment is uploaded to Volume immediately after auto-flush,
+     then the local file is deleted — local disk never exceeds --segment-size.
   3. Trigger bulk_import and poll until done
 
 Install:
-  pip install "pymilvus[bulk_writer]>=2.5" aiohttp tqdm tenacity
+  pip install "pymilvus[bulk_writer]>=2.5" aiohttp tqdm
+  pip install vllm  # optional, for local mode only
 
 Usage:
-  export SILICONFLOW_API_KEY=sk-xxx
   export ZILLIZ_API_KEY=xxx
 
+  # Local mode (vLLM, requires GPU, no API key needed):
   python jsonl_to_parquet.py \
       --input            data.jsonl \
       --output-dir       ./bulk_output \
@@ -23,8 +24,25 @@ Usage:
       --cluster-token    xxx \
       --cluster-id       inxx-xxxx \
       --project-id       proj-xxxx \
-      --model            BAAI/bge-m3 \
-      --dim              1024 \
+      --embed-mode       local \
+      --model            Qwen3-Embedding-4B \
+      --dim              512 \
+      --batch-size       256
+
+  # API mode (remote, any OpenAI-compatible endpoint):
+  export EMBED_API_KEY=sk-xxx
+  python jsonl_to_parquet.py \
+      --input            data.jsonl \
+      --output-dir       ./bulk_output \
+      --collection       caption_collection \
+      --cluster-endpoint https://xxx.api.ali-cn-beijing.cloud.zilliz.com.cn \
+      --cluster-token    xxx \
+      --cluster-id       inxx-xxxx \
+      --project-id       proj-xxxx \
+      --embed-mode       api \
+      --api-base         https://api.siliconflow.cn/v1/embeddings \
+      --model            Qwen3-Embedding-4B \
+      --dim              512 \
       --batch-size       32 \
       --workers          8
 """
@@ -41,12 +59,6 @@ import time
 from pathlib import Path
 
 import aiohttp
-from tenacity import (
-    retry,
-    stop_after_attempt,
-    wait_exponential,
-    retry_if_exception_type,
-)
 from tqdm import tqdm
 
 from pymilvus import MilvusClient, DataType
@@ -69,7 +81,7 @@ log = logging.getLogger(__name__)
 # ──────────────────────────────────────────────────────────────────────────────
 # Constants
 # ──────────────────────────────────────────────────────────────────────────────
-SF_ENDPOINT = "https://api.siliconflow.cn/v1/embeddings"
+DEFAULT_API_ENDPOINT = "https://api.siliconflow.cn/v1/embeddings"
 ZILLIZ_CLOUD_CN = "https://api.cloud.zilliz.com.cn"
 
 
@@ -116,30 +128,25 @@ def create_collection(client: MilvusClient, name: str, dim: int) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Step 2a: SiliconFlow embedding (async, concurrent workers)
+# Step 2a: Embedding — remote API (OpenAI-compatible)
 # ──────────────────────────────────────────────────────────────────────────────
-class SiliconFlowEmbedder:
-    """Async client that calls SiliconFlow /v1/embeddings with concurrency."""
+class ApiEmbedder:
+    """Async client that calls any OpenAI-compatible /v1/embeddings endpoint."""
 
     def __init__(self, api_key: str, model: str, dim: int,
-                 workers: int, max_retries: int):
+                 workers: int, max_retries: int, endpoint: str):
         self.api_key = api_key
         self.model = model
         self.dim = dim
         self.workers = workers
         self.max_retries = max_retries
+        self.endpoint = endpoint
         self._sem: asyncio.Semaphore | None = None
         self._session: aiohttp.ClientSession | None = None
 
     async def _ensure_session(self):
         if self._session is None or self._session.closed:
-            # import ssl
-            # ssl_ctx = ssl.create_default_context()
-            # ssl_ctx.check_hostname = False
-            # ssl_ctx.verify_mode = ssl.CERT_NONE
-            # connector = aiohttp.TCPConnector(ssl=ssl_ctx)
             self._session = aiohttp.ClientSession(
-                # connector=connector,
                 headers={
                     "Authorization": f"Bearer {self.api_key}",
                     "Content-Type": "application/json",
@@ -166,7 +173,7 @@ class SiliconFlowEmbedder:
         for attempt in range(1, self.max_retries + 1):
             async with self._sem:
                 try:
-                    async with self._session.post(SF_ENDPOINT, json=payload) as resp:
+                    async with self._session.post(self.endpoint, json=payload) as resp:
                         if resp.status == 429:
                             wait = min(2 ** attempt, 30)
                             log.warning("Rate limited (429), waiting %ds …", wait)
@@ -185,13 +192,59 @@ class SiliconFlowEmbedder:
                     await asyncio.sleep(wait)
 
         raise RuntimeError(
-            f"SiliconFlow API failed after {self.max_retries} retries: {last_exc}"
+            f"Embedding API failed after {self.max_retries} retries: {last_exc}"
         )
 
     async def embed_batches(self, batches: list[list[str]]) -> list[list[list[float]]]:
         """Embed multiple batches concurrently."""
         tasks = [self._call_api(b) for b in batches]
         return await asyncio.gather(*tasks)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Step 2a (alt): Embedding — local vLLM inference
+# ──────────────────────────────────────────────────────────────────────────────
+class LocalEmbedder:
+    """Local embedding using vLLM's offline LLM engine.
+    --workers is ignored; vLLM manages GPU parallelism internally.
+    --batch-size controls how many texts are fed to llm.embed() at once."""
+
+    def __init__(self, model: str, dim: int):
+        try:
+            from vllm import LLM
+        except ImportError:
+            sys.exit("Run:  pip install vllm")
+        log.info("Loading local model '%s' via vLLM …", model)
+        self.model_name = model
+        self.dim = dim
+        self.llm = LLM(model=model, runner="pooling")
+
+    async def embed_batches(self, batches: list[list[str]]) -> list[list[list[float]]]:
+        """Embed batches locally. No sub-batching — vLLM handles parallelism."""
+        results = []
+        for batch in batches:
+            outputs = self.llm.embed(batch)
+            results.append([o.outputs.embedding[:self.dim] for o in outputs])
+        return results
+
+    async def close(self):
+        pass  # no-op for local
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Embedder factory
+# ──────────────────────────────────────────────────────────────────────────────
+def create_embedder(args) -> ApiEmbedder | LocalEmbedder:
+    if args.embed_mode == "local":
+        return LocalEmbedder(model=args.model, dim=args.dim)
+    else:
+        if not args.api_key:
+            raise ValueError("--api-key or EMBED_API_KEY env var required when --embed-mode=api")
+        return ApiEmbedder(
+            api_key=args.api_key, model=args.model, dim=args.dim,
+            workers=args.workers, max_retries=args.max_retries,
+            endpoint=args.api_base,
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -296,13 +349,7 @@ async def stream_embed_write(args: argparse.Namespace, vfm) -> None:
     ckpt_path = Path(args.output_dir) / "checkpoint.json"
     resume_offset = load_checkpoint(ckpt_path)
 
-    embedder = SiliconFlowEmbedder(
-        api_key=args.sf_api_key,
-        model=args.model,
-        dim=args.dim,
-        workers=args.workers,
-        max_retries=args.max_retries,
-    )
+    embedder = create_embedder(args)
 
     log.info("Counting lines in %s …", args.input)
     total = count_lines(args.input)
@@ -331,10 +378,11 @@ async def stream_embed_write(args: argparse.Namespace, vfm) -> None:
 
         vectors = []
         if texts_to_embed:
-            # Split into API-sized sub-batches (max 32)
+            # Split into sub-batches sized by --batch-size
+            bs = args.batch_size
             sub_batches = [
-                texts_to_embed[i:i + 32]
-                for i in range(0, len(texts_to_embed), 32)
+                texts_to_embed[i:i + bs]
+                for i in range(0, len(texts_to_embed), bs)
             ]
             results = await embedder.embed_batches(sub_batches)
             for sub_result in results:
@@ -539,7 +587,7 @@ def run(args: argparse.Namespace):
 # ──────────────────────────────────────────────────────────────────────────────
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="JSONL → Zilliz Cloud with SiliconFlow embeddings.",
+        description="JSONL → Zilliz Cloud with embeddings (API or local vLLM).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -548,14 +596,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-dir",   default="./bulk_output", help="Local dir for Parquet output")
 
     # Embedding
-    p.add_argument("--model",        default="BAAI/bge-m3", help="SiliconFlow model name")
-    p.add_argument("--dim",          type=int, default=1024, help="Embedding dimension")
-    p.add_argument("--batch-size",   type=int, default=32,   help="Texts per API call (max 32)")
-    p.add_argument("--workers",      type=int, default=8,    help="Concurrent API workers")
-    p.add_argument("--max-retries",  type=int, default=3,    help="Max retries per API call")
+    p.add_argument("--embed-mode",   choices=["api", "local"], default="api",
+                                     help="'api' for remote API, 'local' for vLLM local inference")
+    p.add_argument("--model",        default="Qwen3-Embedding-4B", help="Embedding model name")
+    p.add_argument("--dim",          type=int, default=512, help="Embedding dimension")
+    p.add_argument("--batch-size",   type=int, default=256,  help="Texts per embed call (api: max 32; local: higher for GPU)")
+    p.add_argument("--workers",      type=int, default=8,    help="Concurrent API workers (ignored in local mode)")
+    p.add_argument("--max-retries",  type=int, default=3,    help="Max retries per API call (ignored in local mode)")
+    p.add_argument("--api-base",     default=DEFAULT_API_ENDPOINT,
+                                     help="Embedding API endpoint URL (api mode only)")
+    p.add_argument("--api-key",      default=os.getenv("EMBED_API_KEY", ""),
+                                     help="Embedding API key (api mode only)")
 
     # Writer
-    p.add_argument("--segment-size", type=int, default=1024*1024*10, help="Bytes per Parquet chunk")
+    p.add_argument("--segment-size", type=int, default=1024*1024*128, help="Bytes per Parquet chunk")
 
     # Zilliz Cloud
     p.add_argument("--collection",       required=True, help="Collection name")
@@ -563,19 +617,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cluster-token",    default=os.getenv("ZILLIZ_TOKEN", ""),     help="Cluster access token")
     p.add_argument("--cluster-id",       default=os.getenv("ZILLIZ_CLUSTER_ID", ""), help="Cluster ID")
     p.add_argument("--zilliz-api-key",   default=os.getenv("ZILLIZ_API_KEY", ""),    help="Zilliz Cloud API key")
-    p.add_argument("--volume-name",      default="bulk_import_vol",                  help="Volume name")
+    p.add_argument("--volume-name",      default=os.getenv("ZILLIZ_VOLUME", "bulk_import_vol"), help="Volume name")
     p.add_argument("--project-id",       default=os.getenv("ZILLIZ_PROJECT_ID", ""), help="Project ID")
-    p.add_argument("--region-id",        default="ali-cn-beijing",                   help="Region ID")
+    p.add_argument("--region-id",        default=os.getenv("ZILLIZ_REGION_ID", "ali-cn-beijing"), help="Region ID")
     p.add_argument("--skip-create",      action="store_true", help="Skip collection creation")
-
-    # SiliconFlow
-    p.add_argument("--sf-api-key", default=os.getenv("SILICONFLOW_API_KEY", ""), help="SiliconFlow API key")
 
     args = p.parse_args()
 
     # Validate required keys
-    if not args.sf_api_key:
-        p.error("SiliconFlow API key required (--sf-api-key or SILICONFLOW_API_KEY env var)")
+    if args.embed_mode == "api" and not args.api_key:
+        p.error("--api-key or EMBED_API_KEY env var required when --embed-mode=api")
     if not args.skip_create and (not args.cluster_endpoint or not args.cluster_token):
         p.error("--cluster-endpoint and --cluster-token required unless --skip-create")
     if not args.zilliz_api_key:

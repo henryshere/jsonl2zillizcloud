@@ -6,7 +6,7 @@ A Python CLI script that:
 
 1. **Creates** the Zilliz Cloud collection (with schema, indexes, and `auto_id=True`)
 2. **Ensures** the Zilliz Cloud Volume exists (Alibaba Cloud, Beijing region)
-3. **Streams** a massive JSONL file (up to 500M rows) in constant memory, embeds the `caption` field via SiliconFlow API, writes Parquet segments via `pymilvus.LocalBulkWriter`, and **uploads each segment to Volume immediately after flush, then deletes the local file** — local disk never exceeds ~1 GB
+3. **Streams** a massive JSONL file (up to 500M rows) in constant memory, embeds the `caption` field via remote API or local vLLM, writes Parquet segments via `pymilvus.LocalBulkWriter`, and **uploads each segment to Volume immediately after flush, then deletes the local file** — local disk never exceeds `--segment-size`
 4. **Triggers** `bulk_import` to load all uploaded data into the collection
 
 Use `--skip-create` to skip step 1 if the collection already exists.
@@ -26,17 +26,19 @@ Step 3: Stream JSONL → Embed → Write Parquet → Upload → Delete (per segm
   │
   │  JSONL (stream line-by-line, ~2 KB RAM per line)
   │    │
-  │    ├─ extract caption ──▶ SiliconFlow API (batch=32) ──▶ caption_vector
+  │    ├─ extract caption ──▶ Embedding (API or local vLLM) ──▶ caption_vector
   │    │
   │    ├─ keep all 13 original fields as individual columns
   │    │
   │    ├─ pack entire line ──▶ raw_json (JSON field, ≤64 KB)
   │    │
-  │    └─ LocalBulkWriter (1 GB segment) ──▶ segment.parquet
+  │    └─ LocalBulkWriter auto-flushes at --segment-size
   │         │
-  │         ├─ upload to Volume immediately
-  │         ├─ delete local file
-  │         └─ create fresh writer for next segment
+  │         After each flush_batch(), scan output dir:
+  │         ├─ if new .parquet file found → upload to Volume → delete local
+  │         └─ at end: writer.commit() → upload remaining → delete local
+  │
+  │    Single writer instance for the entire run (no recreation).
   │
   ▼
 Step 4: bulk_import into Collection (all segments already on Volume)
@@ -45,14 +47,16 @@ Step 4: bulk_import into Collection (all segments already on Volume)
 ### Segment Lifecycle (upload-as-you-go)
 
 ```
-  ┌────────────┐     ┌────────────┐     ┌────────────┐
-  │ Write ~170K│     │ Upload to  │     │ Delete     │
-  │ rows into  │────▶│ Volume     │────▶│ local file │──▶ next segment …
-  │ Parquet    │     │            │     │            │
-  └────────────┘     └────────────┘     └────────────┘
-       ~1 GB              network            frees disk
+  ┌─────────────────┐     ┌────────────────┐     ┌────────────┐
+  │ Writer buffer   │     │ Scan output    │     │ Upload &   │
+  │ hits chunk_size │────▶│ dir for new    │────▶│ delete     │
+  │ → auto-flush    │     │ .parquet files │     │ local file │
+  └─────────────────┘     └────────────────┘     └────────────┘
+    --segment-size          after flush_batch()      frees disk
 
-Local disk usage: always ≤ 1 GB (one segment at a time)
+At end: writer.commit() flushes remaining buffer → upload → delete
+
+Local disk usage: always ≤ --segment-size (one segment at a time)
 ```
 
 ---
@@ -81,23 +85,39 @@ Local disk usage: always ≤ 1 GB (one segment at a time)
 
 ## Embedding
 
-| Item             | Value                                            |
-|------------------|--------------------------------------------------|
-| Provider         | SiliconFlow REST API                             |
-| Endpoint         | `POST https://api.siliconflow.cn/v1/embeddings`  |
-| Auth             | Bearer token via `SILICONFLOW_API_KEY` env var   |
-| Model            | configurable, default `BAAI/bge-m3`              |
-| Input            | `caption` field (full JSON string)               |
-| Output dimension | 1024 (for bge-m3)                                |
-| Batch size       | up to 32 texts per request (API limit)           |
-| Rate limit       | retry with exponential backoff (max 3 retries)   |
-| Concurrency      | `--workers` flag for parallel API calls (default 8) |
+Two modes selected by `--embed-mode`:
+
+### API mode (`--embed-mode api`, default)
+
+| Item             | Value                                                        |
+|------------------|--------------------------------------------------------------|
+| Provider         | Any OpenAI-compatible `/v1/embeddings` endpoint              |
+| Endpoint         | `--api-base` (default: `https://api.siliconflow.cn/v1/embeddings`) |
+| Auth             | Bearer token via `--api-key` or `EMBED_API_KEY` env var      |
+| Model            | `--model` (default `Qwen3-Embedding-4B`)                     |
+| Input            | `caption` field (full JSON string)                           |
+| Output dimension | `--dim` (default 512)                                        |
+| Batch size       | `--batch-size` (default 256, API may limit to 32 per request)|
+| Rate limit       | retry with exponential backoff (max `--max-retries`)         |
+| Concurrency      | `--workers` for parallel API calls (default 8)               |
+
+### Local mode (`--embed-mode local`)
+
+| Item             | Value                                                        |
+|------------------|--------------------------------------------------------------|
+| Engine           | vLLM offline inference (`pip install vllm`)                  |
+| Model            | `--model` (any HuggingFace model, default `Qwen3-Embedding-4B`) |
+| Input            | `caption` field (full JSON string)                           |
+| Output dimension | `--dim` (default 512)                                        |
+| Batch size       | `--batch-size` (default 256, can go higher for GPU throughput) |
+| Concurrency      | Managed by vLLM internally; `--workers` is ignored           |
+| API key          | Not required                                                 |
 
 ---
 
 ## Parquet File Schema (15 columns)
 
-Written by `pymilvus.LocalBulkWriter`, one file per 1 GB segment.
+Written by `pymilvus.LocalBulkWriter`, one file per auto-flushed segment (at `--segment-size`).
 Does **not** contain `autoid` — Zilliz generates it on import.
 
 | Column                   | Parquet Type           | Source                     |
@@ -116,7 +136,7 @@ Does **not** contain `autoid` — Zilliz generates it on import.
 | `image_512`              | UTF-8 string           | original field             |
 | `rand`                   | Float32                | original field             |
 | `raw_json`               | UTF-8 string (JSON)    | entire original JSONL line |
-| `caption_vector`         | list\<float32\> × 1024 | SiliconFlow embedding      |
+| `caption_vector`         | list\<float32\> × `--dim` | embedding (API or local) |
 
 ---
 
@@ -139,7 +159,7 @@ Does **not** contain `autoid` — Zilliz generates it on import.
 | `image_512`              | VARCHAR(1024)        | —                               |
 | `rand`                   | Float                | —                               |
 | `raw_json`               | JSON                 | —                               |
-| `caption_vector`         | FloatVector(1024)    | **vector index (AUTOINDEX)**    |
+| `caption_vector`         | FloatVector(`--dim`) | **vector index (AUTOINDEX)**    |
 
 ### Schema–Parquet Mapping
 
@@ -208,51 +228,55 @@ client.create_collection(
 
 ## CLI Configuration
 
-| Param               | CLI flag           | Env var               | Default                        |
-|----------------------|--------------------|-----------------------|--------------------------------|
-| Input JSONL path     | `--input`          | —                     | required                       |
-| Output directory     | `--output-dir`     | —                     | `./bulk_output`                |
-| SiliconFlow API key  | —                  | `SILICONFLOW_API_KEY` | required                       |
-| Embedding model      | `--model`          | —                     | `BAAI/bge-m3`                  |
-| Vector dimension     | `--dim`            | —                     | `1024`                         |
-| API batch size       | `--batch-size`     | —                     | `32`                           |
-| Async workers        | `--workers`        | —                     | `8`                            |
-| Segment size         | `--segment-size`   | —                     | `1GB`                          |
-| Max retries          | `--max-retries`    | —                     | `3`                            |
-| Checkpoint file      | `--checkpoint`     | —                     | `<output-dir>/checkpoint.json` |
-| Collection name      | `--collection`     | `ZILLIZ_COLLECTION`   | required                       |
-| Cluster endpoint     | `--cluster-endpoint`| `ZILLIZ_ENDPOINT`    | required                       |
-| Cluster token        | `--cluster-token`  | `ZILLIZ_TOKEN`        | required                       |
-| Cluster ID           | `--cluster-id`     | `ZILLIZ_CLUSTER_ID`   | required                       |
-| Zilliz API key       | `--zilliz-api-key` | `ZILLIZ_API_KEY`      | required                       |
-| Volume name          | `--volume-name`    | `ZILLIZ_VOLUME`       | `bulk_import_vol`              |
-| Project ID           | `--project-id`     | `ZILLIZ_PROJECT_ID`   | required                       |
-| Region ID            | `--region-id`      | `ZILLIZ_REGION_ID`    | `ali-cn-beijing`               |
-| Skip create          | `--skip-create`    | —                     | `false`                        |
+| Param               | CLI flag            | Env var               | Default                                    |
+|----------------------|---------------------|-----------------------|--------------------------------------------|
+| Input JSONL path     | `--input`           | —                     | required                                   |
+| Output directory     | `--output-dir`      | —                     | `./bulk_output`                            |
+| Embed mode           | `--embed-mode`      | —                     | `api`                                      |
+| Embedding model      | `--model`           | —                     | `Qwen3-Embedding-4B`                      |
+| Vector dimension     | `--dim`             | —                     | `512`                                      |
+| Batch size           | `--batch-size`      | —                     | `256`                                      |
+| API endpoint         | `--api-base`        | —                     | `https://api.siliconflow.cn/v1/embeddings` |
+| API key              | `--api-key`         | `EMBED_API_KEY`       | required in api mode only                  |
+| Async workers        | `--workers`         | —                     | `8` (api mode only)                        |
+| Max retries          | `--max-retries`     | —                     | `3` (api mode only)                        |
+| Segment size         | `--segment-size`    | —                     | `128MB`                                    |
+| Collection name      | `--collection`      | —                     | required                                   |
+| Cluster endpoint     | `--cluster-endpoint`| `ZILLIZ_ENDPOINT`     | required                                   |
+| Cluster token        | `--cluster-token`   | `ZILLIZ_TOKEN`        | required                                   |
+| Cluster ID           | `--cluster-id`      | `ZILLIZ_CLUSTER_ID`   | required                                   |
+| Zilliz API key       | `--zilliz-api-key`  | `ZILLIZ_API_KEY`      | required                                   |
+| Volume name          | `--volume-name`     | `ZILLIZ_VOLUME`       | `bulk_import_vol`                          |
+| Project ID           | `--project-id`      | `ZILLIZ_PROJECT_ID`   | required                                   |
+| Region ID            | `--region-id`       | `ZILLIZ_REGION_ID`    | `ali-cn-beijing`                           |
+| Skip create          | `--skip-create`     | —                     | `false`                                    |
+
+Checkpoint is stored automatically at `<output-dir>/checkpoint.json` (no CLI flag).
 
 ---
 
 ## Memory & Disk Usage
 
-| Resource | Component                       | Usage                |
-|----------|---------------------------------|----------------------|
-| RAM      | JSONL reader                    | ~2 KB (one line)     |
-| RAM      | SiliconFlow API text batch      | 32 × ~1.5 KB ≈ 48 KB|
-| RAM      | LocalBulkWriter segment buffer  | up to 1 GB           |
-| **RAM**  | **Total peak**                  | **~1 GB**            |
-| Disk     | One Parquet segment (written, pending upload) | up to 1 GB |
-| Disk     | Checkpoint file                 | < 1 KB               |
-| **Disk** | **Total peak**                  | **~1 GB**            |
+| Resource | Component                       | Usage                     |
+|----------|---------------------------------|---------------------------|
+| RAM      | JSONL reader                    | ~2 KB (one line)          |
+| RAM      | SiliconFlow API text batch      | 32 × ~1.5 KB ≈ 48 KB     |
+| RAM      | LocalBulkWriter segment buffer  | up to `--segment-size`    |
+| **RAM**  | **Total peak**                  | **≈ `--segment-size`**    |
+| Disk     | One Parquet segment (written, pending upload) | up to `--segment-size` |
+| Disk     | Checkpoint file                 | < 1 KB                    |
+| **Disk** | **Total peak**                  | **≈ `--segment-size`**    |
 
 Both RAM and disk are constant regardless of total file size (500M rows safe).
-Segments are uploaded to Volume and deleted locally immediately after flush — no accumulation.
+Segments are uploaded to Volume and deleted locally immediately after auto-flush — no accumulation.
+Default `--segment-size` is 10 MB; increase to 128 MB–1 GB for production runs.
 
 ---
 
 ## Checkpoint & Resume
 
-- After each Parquet segment is flushed, write the current JSONL line offset to `checkpoint.json`
-- On restart with `--checkpoint`, skip to the saved offset and resume
+- Checkpoint saved periodically (every 10,000 lines) to `<output-dir>/checkpoint.json`
+- On restart, the script auto-detects the checkpoint file and resumes from the saved line offset
 - Guarantees no duplicate rows and no re-embedding after crash
 
 ---
@@ -262,11 +286,11 @@ Segments are uploaded to Volume and deleted locally immediately after flush — 
 | Scenario                          | Behavior                                           |
 |-----------------------------------|-----------------------------------------------------|
 | Malformed JSONL line              | Log warning, skip line, continue                    |
-| Empty / null caption              | Log warning, write null vector                      |
-| SiliconFlow 429 (rate limit)      | Retry with exponential backoff, up to 3 times       |
-| SiliconFlow 5xx / timeout         | Retry with backoff; abort after max retries         |
-| raw_json exceeds 64 KB            | Log warning, truncate or skip                       |
-| Upload failure                    | Retry 3× with backoff; abort on persistent failure  |
+| Empty / null caption              | Log warning, write zero vector (`[0.0] * dim`)      |
+| API 429 (rate limit)              | Retry with exponential backoff, up to `--max-retries` |
+| API 5xx / timeout                 | Retry with backoff; abort after `--max-retries`     |
+| raw_json exceeds 64 KB            | Log warning, truncate                               |
+| Vector contains non-float values  | Force all elements to `float()` before writing      |
 
 ---
 
@@ -284,10 +308,12 @@ Segments are uploaded to Volume and deleted locally immediately after flush — 
 ## Dependencies
 
 ```
-pymilvus>=2.5
+pymilvus[bulk_writer]>=2.5
 aiohttp
 tqdm
-tenacity
+
+# Optional (local mode only):
+vllm
 ```
 
 ---
