@@ -9,8 +9,9 @@ End-to-end pipeline:
   3. Trigger bulk_import and poll until done
 
 Install:
-  pip install "pymilvus[bulk_writer]>=2.5" aiohttp tqdm
-  pip install vllm  # optional, for local mode only
+  pip install "pymilvus[bulk_writer]>=2.5" tqdm
+  pip install aiohttp   # required for --embed-mode=api only
+  pip install vllm      # required for --embed-mode=local only
 
 Usage:
   export ZILLIZ_API_KEY=xxx
@@ -58,7 +59,6 @@ import sys
 import time
 from pathlib import Path
 
-import aiohttp
 from tqdm import tqdm
 
 from pymilvus import MilvusClient, DataType
@@ -71,30 +71,20 @@ from pymilvus.bulk_writer import (
 from pymilvus.bulk_writer.volume_manager import VolumeManager
 from pymilvus.bulk_writer.volume_file_manager import VolumeFileManager
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
 log = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Constants
 # ──────────────────────────────────────────────────────────────────────────────
-DEFAULT_API_ENDPOINT = "https://api.siliconflow.cn/v1/embeddings"
 ZILLIZ_CLOUD_CN = "https://api.cloud.zilliz.com.cn"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Step 1: Create collection
+# Schema (shared by collection creation and bulk writer)
 # ──────────────────────────────────────────────────────────────────────────────
-def create_collection(client: MilvusClient, name: str, dim: int) -> None:
-    """Create collection with auto_id, schema, and indexes."""
-    if client.has_collection(name):
-        log.info("Collection '%s' already exists, skipping creation.", name)
-        return
-
-    schema = client.create_schema(auto_id=True, enable_dynamic_field=False)
+def build_schema(dim: int):
+    """Build the canonical 16-field schema used by both collection and writer."""
+    schema = MilvusClient.create_schema(auto_id=True, enable_dynamic_field=False)
 
     schema.add_field("autoid",                 DataType.INT64,        is_primary=True)
     schema.add_field("id",                     DataType.VARCHAR,      max_length=128)
@@ -112,6 +102,21 @@ def create_collection(client: MilvusClient, name: str, dim: int) -> None:
     schema.add_field("rand",                   DataType.FLOAT)
     schema.add_field("raw_json",               DataType.JSON)
     schema.add_field("caption_vector",         DataType.FLOAT_VECTOR, dim=dim)
+    schema.verify()
+
+    return schema
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Step 1: Create collection
+# ──────────────────────────────────────────────────────────────────────────────
+def create_collection(client: MilvusClient, name: str, dim: int) -> None:
+    """Create collection with auto_id, schema, and indexes."""
+    if client.has_collection(name):
+        log.info("Collection '%s' already exists, skipping creation.", name)
+        return
+
+    schema = build_schema(dim)
 
     index_params = client.prepare_index_params()
     index_params.add_index(field_name="caption_vector", index_type="AUTOINDEX", metric_type="COSINE")
@@ -130,11 +135,18 @@ def create_collection(client: MilvusClient, name: str, dim: int) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 # Step 2a: Embedding — remote API (OpenAI-compatible)
 # ──────────────────────────────────────────────────────────────────────────────
+class _RateLimited(Exception):
+    """Sentinel for 429 responses — used to break out of semaphore before sleeping."""
+    pass
+
+
 class ApiEmbedder:
     """Async client that calls any OpenAI-compatible /v1/embeddings endpoint."""
 
     def __init__(self, api_key: str, model: str, dim: int,
                  workers: int, max_retries: int, endpoint: str):
+        import aiohttp as _aiohttp
+        self._aiohttp = _aiohttp
         self.api_key = api_key
         self.model = model
         self.dim = dim
@@ -142,9 +154,10 @@ class ApiEmbedder:
         self.max_retries = max_retries
         self.endpoint = endpoint
         self._sem: asyncio.Semaphore | None = None
-        self._session: aiohttp.ClientSession | None = None
+        self._session = None
 
     async def _ensure_session(self):
+        aiohttp = self._aiohttp
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 headers={
@@ -171,25 +184,22 @@ class ApiEmbedder:
 
         last_exc = None
         for attempt in range(1, self.max_retries + 1):
-            async with self._sem:
-                try:
+            try:
+                async with self._sem:
                     async with self._session.post(self.endpoint, json=payload) as resp:
                         if resp.status == 429:
-                            wait = min(2 ** attempt, 30)
-                            log.warning("Rate limited (429), waiting %ds …", wait)
-                            await asyncio.sleep(wait)
-                            continue
+                            raise _RateLimited()
                         resp.raise_for_status()
                         body = await resp.json()
                         # sort by index to guarantee order
                         data = sorted(body["data"], key=lambda d: d["index"])
                         return [d["embedding"] for d in data]
-                except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                    last_exc = exc
-                    wait = min(2 ** attempt, 30)
-                    log.warning("API error (attempt %d/%d): %s, retry in %ds",
-                                attempt, self.max_retries, exc, wait)
-                    await asyncio.sleep(wait)
+            except (_RateLimited, self._aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                last_exc = exc
+                wait = min(2 ** attempt, 30)
+                log.warning("API error (attempt %d/%d): %s, retry in %ds",
+                            attempt, self.max_retries, exc, wait)
+                await asyncio.sleep(wait)  # semaphore already released
 
         raise RuntimeError(
             f"Embedding API failed after {self.max_retries} retries: {last_exc}"
@@ -223,7 +233,7 @@ class LocalEmbedder:
         """Embed batches locally. No sub-batching — vLLM handles parallelism."""
         results = []
         for batch in batches:
-            outputs = self.llm.embed(batch)
+            outputs = await asyncio.to_thread(self.llm.embed, batch)
             results.append([o.outputs.embedding[:self.dim] for o in outputs])
         return results
 
@@ -250,28 +260,21 @@ def create_embedder(args) -> ApiEmbedder | LocalEmbedder:
 # ──────────────────────────────────────────────────────────────────────────────
 # Step 2b: Stream JSONL → embed → write Parquet
 # ──────────────────────────────────────────────────────────────────────────────
-def count_lines(path: str) -> int:
-    n = 0
-    with open(path, "rb") as fh:
-        for chunk in iter(lambda: fh.read(1 << 20), b""):
-            n += chunk.count(b"\n")
-    return n
-
-
-def load_checkpoint(ckpt_path: Path) -> int:
-    """Return the line offset to resume from (0-based)."""
+def load_checkpoint(ckpt_path: Path) -> tuple[int, int]:
+    """Return (line_offset, segment_idx) to resume from."""
     if ckpt_path.exists():
         with open(ckpt_path) as f:
             data = json.load(f)
             offset = data.get("line_offset", 0)
-            log.info("Resuming from checkpoint: line %d", offset)
-            return offset
-    return 0
+            seg_idx = data.get("segment_idx", 0)
+            log.info("Resuming from checkpoint: line %d, segment %d", offset, seg_idx)
+            return offset, seg_idx
+    return 0, 0
 
 
-def save_checkpoint(ckpt_path: Path, line_offset: int) -> None:
+def save_checkpoint(ckpt_path: Path, line_offset: int, segment_idx: int) -> None:
     with open(ckpt_path, "w") as f:
-        json.dump({"line_offset": line_offset}, f)
+        json.dump({"line_offset": line_offset, "segment_idx": segment_idx}, f)
 
 
 def build_writer(schema, output_dir: str, segment_size: int) -> LocalBulkWriter:
@@ -281,31 +284,6 @@ def build_writer(schema, output_dir: str, segment_size: int) -> LocalBulkWriter:
         chunk_size=segment_size,
         file_type=BulkFileType.PARQUET,
     )
-
-
-
-def build_schema_for_writer(dim: int):
-    schema = MilvusClient.create_schema(auto_id=True, enable_dynamic_field=False)
-
-    schema.add_field("autoid",                 DataType.INT64,        is_primary=True)
-    schema.add_field("id",                     DataType.VARCHAR,      max_length=128)
-    schema.add_field("path",                   DataType.VARCHAR,      max_length=1024)
-    schema.add_field("height",                 DataType.INT32)
-    schema.add_field("width",                  DataType.INT32)
-    schema.add_field("caption",                DataType.VARCHAR,      max_length=65535)
-    schema.add_field("caption_version",        DataType.VARCHAR,      max_length=32)
-    schema.add_field("text_ratio",             DataType.FLOAT)
-    schema.add_field("craft_bbox_num",         DataType.INT32)
-    schema.add_field("fused_image",            DataType.FLOAT)
-    schema.add_field("fused_image_aesthetic",  DataType.FLOAT)
-    schema.add_field("fused_image_technical",  DataType.FLOAT)
-    schema.add_field("image_512",              DataType.VARCHAR,      max_length=1024)
-    schema.add_field("rand",                   DataType.FLOAT)
-    schema.add_field("raw_json",               DataType.JSON)
-    schema.add_field("caption_vector",         DataType.FLOAT_VECTOR, dim=dim)
-    schema.verify()
-
-    return schema
 
 
 def make_row(record: dict, vector: list[float] | None, dim: int) -> dict:
@@ -344,16 +322,12 @@ async def stream_embed_write(args: argparse.Namespace, vfm) -> None:
     Streams JSONL → embeds → writes Parquet segments.
     Each segment is uploaded to Volume and deleted locally immediately.
     """
-    schema = build_schema_for_writer(args.dim)
+    schema = build_schema(args.dim)
 
     ckpt_path = Path(args.output_dir) / "checkpoint.json"
-    resume_offset = load_checkpoint(ckpt_path)
+    resume_offset, resumed_segment_idx = load_checkpoint(ckpt_path)
 
     embedder = create_embedder(args)
-
-    log.info("Counting lines in %s …", args.input)
-    total = count_lines(args.input)
-    log.info("~%d lines found.", total)
 
     log.info("Segment size: %d MB. Writer auto-flushes at this size.",
              args.segment_size // (1024 * 1024))
@@ -364,17 +338,61 @@ async def stream_embed_write(args: argparse.Namespace, vfm) -> None:
     total_uploaded = 0
 
     # Accumulators for micro-batching
-    batch_texts: list[str] = []        # texts to embed
+    batch_texts: list[str] = []        # texts to embed ("" if no caption)
     batch_records: list[dict] = []     # corresponding records
-    batch_has_text: list[bool] = []    # whether each record has text
+    texts_in_batch = 0
+    segment_idx = resumed_segment_idx
+    line_no = 0
+
+    async def upload_ready_parquets(label: str = ""):
+        """Scan output dir for .parquet files, upload and delete them."""
+        nonlocal segment_idx, total_uploaded
+        data_dir = Path(str(writer.data_path))
+        if not data_dir.exists():
+            return
+        parquet_files = sorted(data_dir.glob("*.parquet"))
+        for pf in parquet_files:
+            remote_name = f"part-{segment_idx:06d}.parquet"
+            renamed = pf.parent / remote_name
+            pf.rename(renamed)
+
+            uploaded = False
+            for attempt in range(1, 4):
+                try:
+                    await asyncio.to_thread(
+                        vfm.upload_file_to_volume,
+                        source_file_path=str(renamed),
+                        target_volume_path="data/",
+                    )
+                    uploaded = True
+                    break
+                except Exception as exc:
+                    wait = min(2 ** attempt, 30)
+                    log.warning("Upload failed (attempt %d/3): %s, retry in %ds",
+                                attempt, exc, wait)
+                    await asyncio.sleep(wait)
+
+            tag = f"[{label}] " if label else ""
+            if uploaded:
+                log.info("%sUploaded %s (%d MB)", tag, remote_name,
+                         renamed.stat().st_size // (1024 * 1024))
+                renamed.unlink()
+                segment_idx += 1
+                total_uploaded += 1
+                save_checkpoint(ckpt_path, line_no, segment_idx)
+            else:
+                log.error("%sFailed to upload %s after 3 attempts. "
+                          "File kept at %s for manual retry.", tag, remote_name, renamed)
+                raise RuntimeError(f"Upload failed for {remote_name}")
 
     async def flush_batch():
         """Embed accumulated texts and write all rows to writer."""
+        nonlocal texts_in_batch
         if not batch_records:
             return
 
         # Collect texts that need embedding
-        texts_to_embed = [t for t, has in zip(batch_texts, batch_has_text) if has]
+        texts_to_embed = [t for t in batch_texts if t]
 
         vectors = []
         if texts_to_embed:
@@ -389,8 +407,8 @@ async def stream_embed_write(args: argparse.Namespace, vfm) -> None:
                 vectors.extend(sub_result)
 
         vec_idx = 0
-        for record, has_text in zip(batch_records, batch_has_text):
-            if has_text:
+        for record, text in zip(batch_records, batch_texts):
+            if text:
                 vec = vectors[vec_idx]
                 vec_idx += 1
             else:
@@ -400,37 +418,14 @@ async def stream_embed_write(args: argparse.Namespace, vfm) -> None:
 
         batch_texts.clear()
         batch_records.clear()
-        batch_has_text.clear()
+        texts_in_batch = 0
 
         # Check if writer auto-flushed any Parquet files
-        upload_ready_parquets("auto-flush")
+        await upload_ready_parquets("auto-flush")
 
-    segment_idx = 0
-
-    def upload_ready_parquets(label: str = ""):
-        """Scan output dir for .parquet files, upload and delete them."""
-        nonlocal segment_idx, total_uploaded
-        data_dir = Path(str(writer.data_path))
-        if not data_dir.exists():
-            return
-        parquet_files = sorted(data_dir.glob("*.parquet"))
-        for pf in parquet_files:
-            remote_name = f"part-{segment_idx:06d}.parquet"
-            renamed = pf.parent / remote_name
-            pf.rename(renamed)
-            vfm.upload_file_to_volume(
-                source_file_path=str(renamed),
-                target_volume_path="data/",
-            )
-            tag = f"[{label}] " if label else ""
-            log.info("%sUploaded %s (%d MB)", tag, remote_name,
-                     renamed.stat().st_size // (1024 * 1024))
-            renamed.unlink()
-            segment_idx += 1
-            total_uploaded += 1
-
-    line_no = 0
-    with tqdm(total=total, desc="Processing", unit="row", initial=resume_offset) as bar:
+    with tqdm(desc="Processing", unit="row") as bar:
+        if resume_offset:
+            bar.update(resume_offset)
         with open(args.input, encoding="utf-8") as fh:
             for raw_line in fh:
                 line_no += 1
@@ -454,18 +449,19 @@ async def stream_embed_write(args: argparse.Namespace, vfm) -> None:
 
                 batch_records.append(record)
                 batch_texts.append(str(caption) if has_text else "")
-                batch_has_text.append(has_text)
 
-                if not has_text:
+                if has_text:
+                    texts_in_batch += 1
+                else:
                     log.warning("Empty caption at line %d, id=%s", line_no, record.get("id", "?"))
 
                 # Flush embedding batch when full
-                if sum(batch_has_text) >= args.batch_size:
+                if texts_in_batch >= args.batch_size:
                     await flush_batch()
 
                 # Save checkpoint periodically (every 10k lines)
                 if line_no % 10000 == 0:
-                    save_checkpoint(ckpt_path, line_no)
+                    save_checkpoint(ckpt_path, line_no, segment_idx)
 
                 total_rows += 1
                 bar.update(1)
@@ -473,15 +469,15 @@ async def stream_embed_write(args: argparse.Namespace, vfm) -> None:
     # Final flushes
     await flush_batch()
     writer.commit()
-    upload_ready_parquets("final")
+    await upload_ready_parquets("final")
     await embedder.close()
 
-    save_checkpoint(ckpt_path, line_no)
+    save_checkpoint(ckpt_path, line_no, segment_idx)
     log.info("All done. %d rows processed, %d segment(s) uploaded.", total_rows, total_uploaded)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Step 3: Upload to Volume
+# Step 2: Ensure Volume exists
 # ──────────────────────────────────────────────────────────────────────────────
 def ensure_volume(api_key: str, project_id: str, region_id: str, volume_name: str):
     """Create volume if it doesn't exist."""
@@ -514,7 +510,7 @@ def create_volume_file_manager(api_key: str, volume_name: str) -> VolumeFileMana
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Step 4: Trigger bulk_import and poll progress
+# Step 3: Trigger bulk_import and poll progress
 # ──────────────────────────────────────────────────────────────────────────────
 def run_bulk_import(args: argparse.Namespace):
     """Call bulk_import and poll until complete."""
@@ -569,14 +565,14 @@ def run(args: argparse.Namespace):
         create_collection(client, args.collection, args.dim)
         client.close()
 
-    # Step 2: Ensure Volume exists
+    # Step 1b: Ensure Volume exists
     ensure_volume(args.zilliz_api_key, args.project_id, args.region_id, args.volume_name)
     vfm = create_volume_file_manager(args.zilliz_api_key, args.volume_name)
 
-    # Step 3: Stream → embed → write Parquet → upload each segment → delete local
+    # Step 2: Stream → embed → write Parquet → upload each segment → delete local
     asyncio.run(stream_embed_write(args, vfm))
 
-    # Step 4: bulk_import (all segments are already on Volume)
+    # Step 3: bulk_import (all segments are already on Volume)
     run_bulk_import(args)
 
     log.info("All done.")
@@ -603,8 +599,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size",   type=int, default=256,  help="Texts per embed call (api: max 32; local: higher for GPU)")
     p.add_argument("--workers",      type=int, default=8,    help="Concurrent API workers (ignored in local mode)")
     p.add_argument("--max-retries",  type=int, default=3,    help="Max retries per API call (ignored in local mode)")
-    p.add_argument("--api-base",     default=DEFAULT_API_ENDPOINT,
-                                     help="Embedding API endpoint URL (api mode only)")
+    p.add_argument("--api-base",     default="",
+                                     help="Embedding API endpoint URL (required in api mode)")
     p.add_argument("--api-key",      default=os.getenv("EMBED_API_KEY", ""),
                                      help="Embedding API key (api mode only)")
 
@@ -627,6 +623,8 @@ def parse_args() -> argparse.Namespace:
     # Validate required keys
     if args.embed_mode == "api" and not args.api_key:
         p.error("--api-key or EMBED_API_KEY env var required when --embed-mode=api")
+    if args.embed_mode == "api" and not args.api_base:
+        p.error("--api-base required when --embed-mode=api")
     if not args.skip_create and (not args.cluster_endpoint or not args.cluster_token):
         p.error("--cluster-endpoint and --cluster-token required unless --skip-create")
     if not args.zilliz_api_key:
@@ -640,4 +638,9 @@ def parse_args() -> argparse.Namespace:
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
     run(parse_args())

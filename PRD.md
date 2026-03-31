@@ -260,7 +260,7 @@ Checkpoint is stored automatically at `<output-dir>/checkpoint.json` (no CLI fla
 | Resource | Component                       | Usage                     |
 |----------|---------------------------------|---------------------------|
 | RAM      | JSONL reader                    | ~2 KB (one line)          |
-| RAM      | SiliconFlow API text batch      | 32 × ~1.5 KB ≈ 48 KB     |
+| RAM      | Embedding API text batch        | 32 × ~1.5 KB ≈ 48 KB     |
 | RAM      | LocalBulkWriter segment buffer  | up to `--segment-size`    |
 | **RAM**  | **Total peak**                  | **≈ `--segment-size`**    |
 | Disk     | One Parquet segment (written, pending upload) | up to `--segment-size` |
@@ -269,13 +269,14 @@ Checkpoint is stored automatically at `<output-dir>/checkpoint.json` (no CLI fla
 
 Both RAM and disk are constant regardless of total file size (500M rows safe).
 Segments are uploaded to Volume and deleted locally immediately after auto-flush — no accumulation.
-Default `--segment-size` is 10 MB; increase to 128 MB–1 GB for production runs.
+Default `--segment-size` is 128 MB; increase to 512 MB–1 GB for production runs.
 
 ---
 
 ## Checkpoint & Resume
 
 - Checkpoint saved periodically (every 10,000 lines) to `<output-dir>/checkpoint.json`
+- Stores both `line_offset` and `segment_idx` to prevent filename collisions on resume
 - On restart, the script auto-detects the checkpoint file and resumes from the saved line offset
 - Guarantees no duplicate rows and no re-embedding after crash
 
@@ -309,11 +310,11 @@ Default `--segment-size` is 10 MB; increase to 128 MB–1 GB for production runs
 
 ```
 pymilvus[bulk_writer]>=2.5
-aiohttp
 tqdm
 
-# Optional (local mode only):
-vllm
+# Optional (pick one based on --embed-mode):
+aiohttp   # required for --embed-mode=api
+vllm      # required for --embed-mode=local
 ```
 
 ---
