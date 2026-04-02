@@ -55,8 +55,10 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from tqdm import tqdm
@@ -80,10 +82,20 @@ ZILLIZ_CLOUD_CN = "https://api.cloud.zilliz.com.cn"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Pipeline configuration
+# ──────────────────────────────────────────────────────────────────────────────
+@dataclass
+class PipelineConfig:
+    """Centralized pipeline settings, built once from CLI args."""
+    dim: int = 512
+    include_raw_json: bool = True
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Schema (shared by collection creation and bulk writer)
 # ──────────────────────────────────────────────────────────────────────────────
-def build_schema(dim: int):
-    """Build the canonical 16-field schema used by both collection and writer."""
+def build_schema(config: PipelineConfig):
+    """Build the collection/writer schema. Field count depends on config flags."""
     schema = MilvusClient.create_schema(auto_id=True, enable_dynamic_field=False)
 
     schema.add_field("autoid",                 DataType.INT64,        is_primary=True)
@@ -92,6 +104,7 @@ def build_schema(dim: int):
     schema.add_field("height",                 DataType.INT32)
     schema.add_field("width",                  DataType.INT32)
     schema.add_field("caption",                DataType.VARCHAR,      max_length=65535)
+    schema.add_field("caption_json",           DataType.JSON)
     schema.add_field("caption_version",        DataType.VARCHAR,      max_length=32)
     schema.add_field("text_ratio",             DataType.FLOAT)
     schema.add_field("craft_bbox_num",         DataType.INT32)
@@ -100,8 +113,9 @@ def build_schema(dim: int):
     schema.add_field("fused_image_technical",  DataType.FLOAT)
     schema.add_field("image_512",              DataType.VARCHAR,      max_length=1024)
     schema.add_field("rand",                   DataType.FLOAT)
-    schema.add_field("raw_json",               DataType.JSON)
-    schema.add_field("caption_vector",         DataType.FLOAT_VECTOR, dim=dim)
+    if config.include_raw_json:
+        schema.add_field("raw_json",               DataType.JSON)
+    schema.add_field("caption_vector",         DataType.FLOAT_VECTOR, dim=config.dim)
     schema.verify()
 
     return schema
@@ -110,13 +124,13 @@ def build_schema(dim: int):
 # ──────────────────────────────────────────────────────────────────────────────
 # Step 1: Create collection
 # ──────────────────────────────────────────────────────────────────────────────
-def create_collection(client: MilvusClient, name: str, dim: int) -> None:
+def create_collection(client: MilvusClient, name: str, config: PipelineConfig) -> None:
     """Create collection with auto_id, schema, and indexes."""
     if client.has_collection(name):
         log.info("Collection '%s' already exists, skipping creation.", name)
         return
 
-    schema = build_schema(dim)
+    schema = build_schema(config)
 
     index_params = client.prepare_index_params()
     index_params.add_index(field_name="caption_vector", index_type="AUTOINDEX", metric_type="COSINE")
@@ -286,23 +300,43 @@ def build_writer(schema, output_dir: str, segment_size: int) -> LocalBulkWriter:
     )
 
 
-def make_row(record: dict, vector: list[float] | None, dim: int) -> dict:
+def make_row(record: dict, vector: list[float] | None, config: PipelineConfig) -> dict:
     """
     Build a row dict for LocalBulkWriter.append_row().
-    Includes all 13 original fields + raw_json + caption_vector.
+    Includes all 13 original fields + caption_json + caption_vector.
+    Optionally includes raw_json (controlled by config.include_raw_json).
     Does NOT include autoid (Zilliz auto-generates it).
     """
-    raw_json_str = json.dumps(record, ensure_ascii=False)
-    # guard: JSON field max 64 KB
-    if len(raw_json_str.encode("utf-8")) > 65536:
-        log.warning("raw_json exceeds 64 KB for id=%s, truncating.", record.get("id", "?"))
-        raw_json_str = raw_json_str[:65000] + "…}"
-    return {
+    caption_str = str(record.get("caption", ""))
+    try:
+        caption_json = json.loads(caption_str) if caption_str else {}
+    except (json.JSONDecodeError, TypeError) as exc:
+        log.warning("caption is not valid JSON for id=%s: %s", record.get("id", "?"), exc)
+        caption_json = {"_error": f"JSONDecodeError: {exc}"}
+
+    # Type guard: must be a dict
+    if not isinstance(caption_json, dict):
+        log.warning("caption parsed to %s (not dict) for id=%s", type(caption_json).__name__, record.get("id", "?"))
+        caption_json = {"_error": f"expected dict, got {type(caption_json).__name__}"}
+
+    # Key sanitization: replace spaces and special chars with _
+    caption_json = {
+        re.sub(r'[^a-zA-Z0-9_]', '_', k): v
+        for k, v in caption_json.items()
+    }
+
+    # Size guard: must fit in 64 KB
+    if len(json.dumps(caption_json, ensure_ascii=False).encode("utf-8")) > 65536:
+        log.warning("caption_json exceeds 64 KB for id=%s", record.get("id", "?"))
+        caption_json = {"_error": "caption_json exceeds 64 KB"}
+
+    row = {
         "id":                     str(record.get("id", "")),
         "path":                   str(record.get("path", "")),
         "height":                 int(record.get("height", 0)),
         "width":                  int(record.get("width", 0)),
-        "caption":                str(record.get("caption", "")),
+        "caption":                caption_str,
+        "caption_json":           caption_json,
         "caption_version":        str(record.get("caption_version", "")),
         "text_ratio":             float(record.get("text_ratio", 0.0)),
         "craft_bbox_num":         int(record.get("craft_bbox_num", 0)),
@@ -311,18 +345,26 @@ def make_row(record: dict, vector: list[float] | None, dim: int) -> dict:
         "fused_image_technical":  float(record.get("fused_image_technical", 0.0)),
         "image_512":              str(record.get("image_512", "")),
         "rand":                   float(record.get("rand", 0.0)),
-        "raw_json":               json.loads(raw_json_str),  # JSON field expects dict
-        "caption_vector":         [float(x) for x in vector] if vector else [0.0] * dim,
+        "caption_vector":         [float(x) for x in vector] if vector else [0.0] * config.dim,
     }
 
+    if config.include_raw_json:
+        raw_json_str = json.dumps(record, ensure_ascii=False)
+        if len(raw_json_str.encode("utf-8")) > 65536:
+            log.warning("raw_json exceeds 64 KB for id=%s, truncating.", record.get("id", "?"))
+            raw_json_str = raw_json_str[:65000] + "…}"
+        row["raw_json"] = json.loads(raw_json_str)
 
-async def stream_embed_write(args: argparse.Namespace, vfm) -> None:
+    return row
+
+
+async def stream_embed_write(args: argparse.Namespace, vfm, config: PipelineConfig) -> None:
     """
     Main processing loop.
     Streams JSONL → embeds → writes Parquet segments.
     Each segment is uploaded to Volume and deleted locally immediately.
     """
-    schema = build_schema(args.dim)
+    schema = build_schema(config)
 
     ckpt_path = Path(args.output_dir) / "checkpoint.json"
     resume_offset, resumed_segment_idx = load_checkpoint(ckpt_path)
@@ -413,7 +455,7 @@ async def stream_embed_write(args: argparse.Namespace, vfm) -> None:
                 vec_idx += 1
             else:
                 vec = None
-            row = make_row(record, vec, args.dim)
+            row = make_row(record, vec, config)
             writer.append_row(row)
 
         batch_texts.clear()
@@ -559,10 +601,15 @@ def run_bulk_import(args: argparse.Namespace):
 def run(args: argparse.Namespace):
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
+    config = PipelineConfig(
+        dim=args.dim,
+        include_raw_json=not args.no_raw_json,
+    )
+
     # Step 1: Create collection (unless --skip-create)
     if not args.skip_create:
         client = MilvusClient(uri=args.cluster_endpoint, token=args.cluster_token)
-        create_collection(client, args.collection, args.dim)
+        create_collection(client, args.collection, config)
         client.close()
 
     # Step 1b: Ensure Volume exists
@@ -570,7 +617,7 @@ def run(args: argparse.Namespace):
     vfm = create_volume_file_manager(args.zilliz_api_key, args.volume_name)
 
     # Step 2: Stream → embed → write Parquet → upload each segment → delete local
-    asyncio.run(stream_embed_write(args, vfm))
+    asyncio.run(stream_embed_write(args, vfm, config))
 
     # Step 3: bulk_import (all segments are already on Volume)
     run_bulk_import(args)
@@ -617,6 +664,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--project-id",       default=os.getenv("ZILLIZ_PROJECT_ID", ""), help="Project ID")
     p.add_argument("--region-id",        default=os.getenv("ZILLIZ_REGION_ID", "ali-cn-beijing"), help="Region ID")
     p.add_argument("--skip-create",      action="store_true", help="Skip collection creation")
+    p.add_argument("--no-raw-json",      action="store_true", help="Exclude raw_json field from schema and parquet output")
 
     args = p.parse_args()
 
