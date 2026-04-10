@@ -150,7 +150,6 @@ async def stream_embed_write(args: argparse.Namespace, vfm, config: PipelineConf
 
                 batch_records.append(record)
                 batch_texts.append(str(caption) if has_text else "")
-
                 if has_text:
                     texts_in_batch += 1
                 else:

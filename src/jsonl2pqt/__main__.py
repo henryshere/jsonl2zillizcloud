@@ -85,7 +85,7 @@ def parse_args() -> argparse.Namespace:
                                      help="Embedding API key (api mode only)")
 
     # Writer
-    p.add_argument("--segment-size", type=int, default=1024*1024*128, help="Bytes per Parquet chunk")
+    p.add_argument("--segment-size", type=int, default=1024*1024*32, help="Bytes per Parquet chunk")
 
     # Zilliz Cloud
     p.add_argument("--collection",       required=True, help="Collection name")
