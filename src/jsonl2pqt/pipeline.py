@@ -173,4 +173,4 @@ async def stream_embed_write(args: argparse.Namespace, vfm, config: PipelineConf
     await embedder.close()
 
     save_checkpoint(ckpt_path, line_no, segment_idx)
-    log.info("All done. %d rows processed, %d segment(s) uploaded.", total_rows, total_uploaded)
+    log.info("stream_embed_write All done. %d rows processed, %d segment(s) uploaded.", total_rows, total_uploaded)
