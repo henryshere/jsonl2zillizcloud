@@ -1,7 +1,2 @@
-src/jsonl2pqt/__pycache__/__init__.cpython-312.pyc
-src/jsonl2pqt/__pycache__/__main__.cpython-312.pyc
-src/jsonl2pqt/__pycache__/cloud_ops.cpython-312.pyc
-src/jsonl2pqt/__pycache__/config.cpython-312.pyc
-src/jsonl2pqt/__pycache__/embedder.cpython-312.pyc
-src/jsonl2pqt/__pycache__/pipeline.cpython-312.pyc
-src/jsonl2pqt/__pycache__/writer.cpython-312.pyc
+src/jsonl2pqt/__pycache__/
+.claude/
