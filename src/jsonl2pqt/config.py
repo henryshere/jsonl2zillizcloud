@@ -20,6 +20,8 @@ class PipelineConfig:
     """Centralized pipeline settings, built once from CLI args."""
     dim: int = 512
     include_raw_json: bool = True
+    include_caption_str: bool = True
+    include_caption_json: bool = True
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -34,8 +36,10 @@ def build_schema(config: PipelineConfig):
     schema.add_field("path",                   DataType.VARCHAR,      max_length=1024)
     schema.add_field("height",                 DataType.INT32)
     schema.add_field("width",                  DataType.INT32)
-    schema.add_field("caption",                DataType.VARCHAR,      max_length=65535)
-    schema.add_field("caption_json",           DataType.JSON)
+    if config.include_caption_str:
+        schema.add_field("caption_str",            DataType.VARCHAR,      max_length=65535)
+    if config.include_caption_json:
+        schema.add_field("caption_json",           DataType.JSON)
     schema.add_field("caption_version",        DataType.VARCHAR,      max_length=32)
     schema.add_field("text_ratio",             DataType.FLOAT)
     schema.add_field("craft_bbox_num",         DataType.INT32)

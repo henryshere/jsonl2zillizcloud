@@ -40,6 +40,8 @@ def run(args: argparse.Namespace):
     config = PipelineConfig(
         dim=args.dim,
         include_raw_json=not args.no_raw_json,
+        include_caption_str=not args.no_caption_str,
+        include_caption_json=not args.no_caption_json,
     )
 
     # Step 1: Create collection (unless --skip-create)
@@ -97,6 +99,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--project-id",       default=os.getenv("ZILLIZ_PROJECT_ID", ""), help="Project ID")
     p.add_argument("--region-id",        default=os.getenv("ZILLIZ_REGION_ID", "ali-cn-beijing"), help="Region ID")
     p.add_argument("--skip-create",      action="store_true", help="Skip collection creation")
+    p.add_argument("--no-caption-str",   action="store_true",
+                                         help="Exclude caption_str field from schema and parquet output")
+    p.add_argument("--no-caption-json",  action="store_true",
+                                         help="Exclude caption_json field from schema and parquet output (also skips JSON parsing)")
     p.add_argument("--no-raw-json",      action="store_true", help="Exclude raw_json field from schema and parquet output")
 
     args = p.parse_args()

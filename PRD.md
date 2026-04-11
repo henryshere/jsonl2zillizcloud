@@ -67,10 +67,12 @@ The script uses a `PipelineConfig` dataclass to centralize all pipeline settings
 
 ### PipelineConfig fields
 
-| Field              | Type   | CLI source                | Default | Purpose                              |
-|--------------------|--------|---------------------------|---------|--------------------------------------|
-| `dim`              | int    | `--dim`                   | `512`   | Embedding vector dimension           |
-| `include_raw_json` | bool   | inverse of `--no-raw-json`| `True`  | Whether to include `raw_json` field  |
+| Field                  | Type   | CLI source                    | Default | Purpose                                  |
+|------------------------|--------|-------------------------------|---------|------------------------------------------|
+| `dim`                  | int    | `--dim`                       | `512`   | Embedding vector dimension               |
+| `include_raw_json`     | bool   | inverse of `--no-raw-json`    | `True`  | Whether to include `raw_json` field      |
+| `include_caption_str`  | bool   | inverse of `--no-caption-str` | `True`  | Whether to include `caption_str` field   |
+| `include_caption_json` | bool   | inverse of `--no-caption-json`| `True`  | Whether to include `caption_json` field (and run JSON parsing) |
 
 New pipeline-level flags are added as fields here — no function signatures need to change.
 
@@ -141,7 +143,7 @@ Two modes selected by `--embed-mode`:
 
 ---
 
-## Parquet File Schema (16 columns, 15 with `--no-raw-json`)
+## Parquet File Schema (up to 16 columns — `caption_str`, `caption_json`, `raw_json` individually excludable)
 
 Written by `pymilvus.LocalBulkWriter`, one file per auto-flushed segment (at `--segment-size`).
 Does **not** contain `autoid` — Zilliz generates it on import.
@@ -152,8 +154,8 @@ Does **not** contain `autoid` — Zilliz generates it on import.
 | `path`                   | UTF-8 string           | original field             |
 | `height`                 | Int32                  | original field             |
 | `width`                  | Int32                  | original field             |
-| `caption`                | UTF-8 string           | original field             |
-| `caption_json`           | UTF-8 string (JSON)    | parsed caption dict        |
+| `caption_str`            | UTF-8 string           | original `caption` field (excluded with `--no-caption-str`) |
+| `caption_json`           | UTF-8 string (JSON)    | parsed caption dict (excluded with `--no-caption-json`) |
 | `caption_version`        | UTF-8 string           | original field             |
 | `text_ratio`             | Float32                | original field             |
 | `craft_bbox_num`         | Int32                  | original field             |
@@ -167,7 +169,7 @@ Does **not** contain `autoid` — Zilliz generates it on import.
 
 ---
 
-## Zilliz Cloud Collection Schema (17 fields, 16 with `--no-raw-json`)
+## Zilliz Cloud Collection Schema (up to 17 fields — `caption_str`, `caption_json`, `raw_json` individually excludable)
 
 | Field                    | DataType             | Constraints                     |
 |--------------------------|----------------------|---------------------------------|
@@ -176,8 +178,8 @@ Does **not** contain `autoid` — Zilliz generates it on import.
 | `path`                   | VARCHAR(1024)        | —                               |
 | `height`                 | Int32                | **scalar index**                |
 | `width`                  | Int32                | **scalar index**                |
-| `caption`                | VARCHAR(65535)       | —                               |
-| `caption_json`           | JSON                 | —                               |
+| `caption_str`            | VARCHAR(65535)       | excluded with `--no-caption-str` |
+| `caption_json`           | JSON                 | excluded with `--no-caption-json` |
 | `caption_version`        | VARCHAR(32)          | **scalar index**                |
 | `text_ratio`             | Float                | —                               |
 | `craft_bbox_num`         | Int32                | —                               |
@@ -189,6 +191,12 @@ Does **not** contain `autoid` — Zilliz generates it on import.
 | `raw_json`               | JSON                 | excluded with `--no-raw-json`   |
 | `caption_vector`         | FloatVector(`--dim`) | **vector index (AUTOINDEX)**    |
 
+> **Breaking change (vs pre-rename):** The raw-string caption field is now named
+> `caption_str` (previously `caption`). Existing collections created before this
+> rename cannot receive new data from the renamed schema — `bulk_import` will fail
+> due to field-name mismatch. Either drop and recreate the collection, or keep
+> using the old schema version for existing data.
+
 ### Schema–Parquet Mapping
 
 ```
@@ -199,7 +207,7 @@ id                        →        id
 path                      →        path
 height                    →        height
 width                     →        width
-caption                   →        caption
+caption_str               →        caption_str
 caption_json              →        caption_json
 caption_version           →        caption_version
 text_ratio                →        text_ratio
@@ -279,11 +287,13 @@ client.create_collection(
 | Project ID           | `--project-id`      | `ZILLIZ_PROJECT_ID`   | required                                   |
 | Region ID            | `--region-id`       | `ZILLIZ_REGION_ID`    | `ali-cn-beijing`                           |
 | Skip create          | `--skip-create`     | —                     | `false`                                    |
+| Exclude caption_str  | `--no-caption-str`  | —                     | `false`                                    |
+| Exclude caption_json | `--no-caption-json` | —                     | `false`                                    |
 | Exclude raw_json     | `--no-raw-json`     | —                     | `false`                                    |
 
 Checkpoint is stored automatically at `<output-dir>/checkpoint.json` (no CLI flag).
 
-When `--no-raw-json` is set, the `raw_json` field is excluded from both the collection schema and parquet output, reducing storage by ~50%. This flag must be consistent across all runs targeting the same collection — mismatched schemas will cause `bulk_import` to fail.
+The three `--no-*` field flags (`--no-caption-str`, `--no-caption-json`, `--no-raw-json`) independently exclude their respective fields from both the collection schema and parquet output. `--no-caption-json` additionally skips per-row JSON parsing, sanitization, and size-check. All three flags must be consistent across runs targeting the same collection — mismatched schemas will cause `bulk_import` to fail.
 
 ---
 

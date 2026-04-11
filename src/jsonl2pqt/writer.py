@@ -43,40 +43,45 @@ def build_writer(schema, output_dir: str, segment_size: int) -> LocalBulkWriter:
 def make_row(record: dict, vector: list[float] | None, config: PipelineConfig) -> dict:
     """
     Build a row dict for LocalBulkWriter.append_row().
-    Includes all 13 original fields + caption_json + caption_vector.
-    Optionally includes raw_json (controlled by config.include_raw_json).
+    Always includes the base fields + caption_vector.
+    Optionally includes caption_str, caption_json, raw_json based on config flags.
     Does NOT include autoid (Zilliz auto-generates it).
     """
-    caption_str = str(record.get("caption", ""))
-    try:
-        caption_json = json.loads(caption_str) if caption_str else {}
-    except (json.JSONDecodeError, TypeError) as exc:
-        log.warning("caption is not valid JSON for id=%s: %s", record.get("id", "?"), exc)
-        caption_json = {"_error": f"JSONDecodeError: {exc}"}
+    # caption_str: only materialized if stored
+    caption_str = str(record.get("caption", "")) if config.include_caption_str else None
 
-    # Type guard: must be a dict
-    if not isinstance(caption_json, dict):
-        log.warning("caption parsed to %s (not dict) for id=%s", type(caption_json).__name__, record.get("id", "?"))
-        caption_json = {"_error": f"expected dict, got {type(caption_json).__name__}"}
+    # caption_json: parsing + sanitization + size guard skipped entirely when excluded
+    caption_json = None
+    if config.include_caption_json:
+        raw_caption = str(record.get("caption", ""))
+        try:
+            caption_json = json.loads(raw_caption) if raw_caption else {}
+        except (json.JSONDecodeError, TypeError) as exc:
+            log.warning("caption is not valid JSON for id=%s: %s", record.get("id", "?"), exc)
+            caption_json = {"_error": f"JSONDecodeError: {exc}"}
 
-    # Key sanitization: replace spaces and special chars with _
-    caption_json = {
-        re.sub(r'[^a-zA-Z0-9_]', '_', k): v
-        for k, v in caption_json.items()
-    }
+        # Type guard: must be a dict
+        if not isinstance(caption_json, dict):
+            log.warning("caption parsed to %s (not dict) for id=%s",
+                        type(caption_json).__name__, record.get("id", "?"))
+            caption_json = {"_error": f"expected dict, got {type(caption_json).__name__}"}
 
-    # Size guard: must fit in 64 KB
-    if len(json.dumps(caption_json, ensure_ascii=False).encode("utf-8")) > 65536:
-        log.warning("caption_json exceeds 64 KB for id=%s", record.get("id", "?"))
-        caption_json = {"_error": "caption_json exceeds 64 KB"}
+        # Key sanitization: replace spaces and special chars with _
+        caption_json = {
+            re.sub(r'[^a-zA-Z0-9_]', '_', k): v
+            for k, v in caption_json.items()
+        }
+
+        # Size guard: must fit in 64 KB
+        if len(json.dumps(caption_json, ensure_ascii=False).encode("utf-8")) > 65536:
+            log.warning("caption_json exceeds 64 KB for id=%s", record.get("id", "?"))
+            caption_json = {"_error": "caption_json exceeds 64 KB"}
 
     row = {
         "id":                     str(record.get("id", "")),
         "path":                   str(record.get("path", "")),
         "height":                 int(record.get("height", 0)),
         "width":                  int(record.get("width", 0)),
-        "caption":                caption_str,
-        "caption_json":           caption_json,
         "caption_version":        str(record.get("caption_version", "")),
         "text_ratio":             float(record.get("text_ratio", 0.0)),
         "craft_bbox_num":         int(record.get("craft_bbox_num", 0)),
@@ -88,6 +93,10 @@ def make_row(record: dict, vector: list[float] | None, config: PipelineConfig) -
         "caption_vector":         [float(x) for x in vector] if vector else [0.0] * config.dim,
     }
 
+    if config.include_caption_str:
+        row["caption_str"] = caption_str
+    if config.include_caption_json:
+        row["caption_json"] = caption_json
     if config.include_raw_json:
         raw_json_str = json.dumps(record, ensure_ascii=False)
         if len(raw_json_str.encode("utf-8")) > 65536:
