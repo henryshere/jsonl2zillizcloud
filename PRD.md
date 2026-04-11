@@ -363,6 +363,135 @@ vllm      # required for --embed-mode=local
 
 ## Non-Goals
 
-- Image downloading or processing
-- Deduplication
 - Multi-file input (single JSONL → chunked Parquet output)
+- **Variable / inferred JSONL schemas** — see discussion below
+
+### Variable / inferred JSONL schemas (deliberately out of scope)
+
+Today the pipeline has a **hardcoded schema** baked into `config.py`: 16 named fields
+with fixed types, an explicit `make_row()` mapping in `writer.py`, and flag-gated
+inclusion for `caption_str` / `caption_json` / `raw_json`. Extra JSONL keys are silently
+dropped; missing keys fall back to hardcoded defaults. Adapting the tool to a new
+dataset shape requires editing Python in three places (`config.py`, `writer.py`,
+`__main__.py`).
+
+This is a deliberate trade-off. Making the schema configurable is feasible but
+non-trivial, and the current tight coupling buys us type safety, scalar indexes on
+hot fields, per-row CPU efficiency (no schema interpretation in the hot loop),
+constant-memory streaming over 500M rows, and fail-fast behavior on shape
+mismatches. A generic schema system must preserve all five of these.
+
+#### What we'd need to preserve
+
+- Typed Milvus fields — not everything stuffed into a single JSON blob
+- Scalar indexes on queryable fields (`height`, `caption_version`, …)
+- Zero per-row schema interpretation — branches resolved at startup, not per row
+- Constant memory — no full-file scans at startup
+- Fail-fast on shape mismatches — catch problems at row 1, not at row 300M
+- Reproducibility — two runs of the same input must produce identical schemas
+
+#### Options considered
+
+| Option | Summary | Verdict |
+|---|---|---|
+| **Milvus dynamic field** (`enable_dynamic_field=True`) | Declare only primary key + vector + embed source; everything else goes to `$meta`. | Primary mechanism — kills typed indexes. Useful as escape hatch. |
+| **Schema inference from sample** | Read first N lines, infer types and max lengths, build schema at startup. | Non-reproducible; max_length wrong; silent type drift. Useful only as a helper that emits a starter descriptor. |
+| **Declarative schema descriptor** (YAML/JSON) | User commits a `schema.yaml` describing fields, types, sources, transforms, index hints, and embedding source. Parsed once at startup. | Recommended primary mechanism. |
+| **Hybrid: inference helper + descriptor** | `--infer-schema` subcommand samples the JSONL and emits a starter descriptor; user edits it; main pipeline consumes it. | Recommended. Combines zero-config discovery with determinism. |
+
+#### Sketch of the recommended approach
+
+```yaml
+# schema.yaml — committed alongside the dataset
+collection:
+  name: my_collection
+  auto_id: true
+  primary_key: autoid
+
+fields:
+  - name: id
+    type: VARCHAR
+    max_length: 128
+  - name: height
+    type: INT32
+    index: AUTOINDEX
+  - name: caption_str
+    source: caption
+    type: VARCHAR
+    max_length: 65535
+    include: true
+  - name: caption_json
+    source: caption
+    type: JSON
+    transform: parse_json
+    transform_args:
+      sanitize_keys: true
+      max_bytes: 65536
+  - name: raw_json
+    source: $record          # sentinel: the whole JSONL line
+    type: JSON
+    transform: truncate_utf8
+    transform_args:
+      max_bytes: 65536
+
+vector:
+  name: caption_vector
+  source: caption
+  dim: 512
+  index: AUTOINDEX
+  metric: COSINE
+```
+
+**Transforms are named references** to built-in functions (`parse_json`, `truncate_utf8`,
+`coerce_int`, `coerce_float`, `identity`) — users never write Python callbacks. Adding
+a transform means adding a function to a registry module. No `eval`, no `exec`, no
+user-supplied code paths.
+
+**The descriptor is compiled into a closure** at startup so per-row overhead is
+identical to today's hand-written `make_row`. Branches for excluded fields simply
+don't exist in the generated code.
+
+**A fail-fast validator** runs against the first ~100 rows of the JSONL before any
+parquet is written: every `source` field exists, declared types match observed types,
+`VARCHAR max_length` is ≥ observed max, `vector.source` is non-empty in at least one
+row. Catches shape mismatches in ≤ 1 second.
+
+#### Migration from today's hardcoded schema
+
+| Current | After |
+|---|---|
+| `config.py: build_schema(config)` hardcoded | `build_schema(descriptor)` |
+| `writer.py: make_row()` hardcoded map | Generated row-builder closure |
+| `PipelineConfig.include_caption_*` | `include: true/false` per field in descriptor |
+| `--no-caption-str` / `--no-caption-json` / `--no-raw-json` CLI flags | Edit descriptor |
+| `--dim` CLI flag | `vector.dim` in descriptor |
+| Python source edits for each new dataset | Edit `schema.yaml` |
+
+Today's behavior becomes the default descriptor shipped with the tool
+(`schemas/default.yaml`) — existing users see no behavior change.
+
+#### Phased roadmap (if and when we decide to build this)
+
+1. **Descriptor parser + `build_schema(descriptor)`** — small; replaces current `build_schema`.
+2. **Compiled row-builder + transform registry** — medium; replaces `make_row`.
+3. **`--infer-schema` subcommand** — small; samples + emits starter YAML.
+4. **Fail-fast validator** — small; single-pass over a sample of the JSONL.
+5. **Dynamic-field escape hatch** — tiny; `enable_dynamic_field: true` in descriptor.
+
+Phase 1 + 2 alone delivers 80% of the value; phases are independently shippable.
+
+#### What to avoid
+
+- Infer at every run — non-reproducible, slow, silently drifts
+- Milvus dynamic field as the primary mechanism — kills typed indexes
+- User-supplied Python (`lambda`, `exec`, callable paths) in descriptors
+- Skipping the validator — fail-fast is the main win over today's approach
+- Auto-magic — explicit beats clever for batch pipelines
+
+#### Open questions (for whoever picks this up)
+
+1. YAML vs JSON vs TOML for the descriptor format?
+2. Schema descriptor location — alongside the JSONL, alongside the script, or CLI flag?
+3. Multiple vector fields in one collection? (e.g. image + text embeddings)
+4. Nested field flattening — `record["meta"]["source"]` → column `meta_source`, or pre-flatten?
+5. Descriptor versioning — embed `version: 1` so the format can evolve safely?
