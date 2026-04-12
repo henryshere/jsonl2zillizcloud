@@ -98,7 +98,18 @@ class LocalEmbedder:
         log.info("Loading local model '%s' via vLLM …", model)
         self.model_name = model
         self.dim = dim
-        self.llm = LLM(model=model, runner="pooling")
+        self.llm = LLM(
+            model=model,
+            runner="pooling",
+            tensor_parallel_size=2,
+            dtype="auto",
+            gpu_memory_utilization=0.95,
+            swap_space=16,
+            max_model_len=32768,
+            trust_remote_code=True,
+            enforce_eager=True,
+            enable_prefix_caching=True
+        )
 
     async def embed_batches(self, batches: list[list[str]]) -> list[list[list[float]]]:
         """Embed batches locally. No sub-batching — vLLM handles parallelism."""

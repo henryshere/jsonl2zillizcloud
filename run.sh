@@ -11,14 +11,13 @@ export ZILLIZ_CLUSTER_ID=in01-9e68d1ad8e364a2
 export ZILLIZ_PROJECT_ID=proj-7987f39e0bfa02ea9bf116
 
 python3 -m jsonl2pqt \
-    --input            /Users/zilliz/Downloads/playground/vidu/1.jsonl \
-    --output-dir       /Users/zilliz/Downloads/playground/vidu/bulk_output \
-    --collection       test4vidu \
-    --embed-mode       api \
-    --model            BAAI/bge-m3 \
-    --api-base         https://api.siliconflow.cn/v1/embeddings \
-    --batch-size       8 \
-    --dim              1024 \
-    --workers          2 \
+    --input            ～/1.jsonl \
+    --output-dir       ～/bulk_output \
+    --collection       test \
+    --embed-mode       local \
+    --model            ～/qwen_emb \
+    --batch-size       1024 \
+    --dim              512 \
+    --segment-size     $((1024*1024*512)) \
     --no-raw-json
 
